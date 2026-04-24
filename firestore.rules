@@ -1,0 +1,111 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    
+    // ===============================================================
+    // Helper Functions
+    // ===============================================================
+    function isAuthenticated() {
+      return request.auth != null;
+    }
+    
+    function isOwner(userId) {
+      return isAuthenticated() && request.auth.uid == userId;
+    }
+    
+    function isAdmin() {
+      return isAuthenticated() && 
+        (
+          (exists(/databases/$(database)/documents/users/$(request.auth.uid)) && 
+           get(/databases/$(database)/documents/users/$(request.auth.uid)).data.get('role', 'user') == 'admin') ||
+          (request.auth.token.email == "fabricel534@gmail.com" && request.auth.token.get('email_verified', false) == true)
+        );
+    }
+
+    function isNotSuspended() {
+      return !exists(/databases/$(database)/documents/users/$(request.auth.uid)) || 
+             get(/databases/$(database)/documents/users/$(request.auth.uid)).data.get('status', 'active') != 'suspended' ||
+             isAdmin();
+    }
+
+    function hasCredits() {
+      return isAdmin() || 
+        (exists(/databases/$(database)/documents/users/$(request.auth.uid)) && 
+         get(/databases/$(database)/documents/users/$(request.auth.uid)).data.get('credits', 0) > 0);
+    }
+
+    // ===============================================================
+    // Validation Functions
+    // ===============================================================
+    function isValidUser(data) {
+      let isCreating = resource == null;
+      let isSelf = request.auth.uid == data.uid;
+      
+      // Referral bonus logic: new users can have 12 credits if they have a 'referredBy' field
+      let maxInitialCredits = ('referredBy' in data && data.referredBy != null) ? 12 : 10;
+
+      return data.keys().hasAll(['uid', 'email']) &&
+             data.uid is string && data.uid.size() > 0 &&
+             data.email is string && data.email.matches("^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\\.[a-zA-Z]{2,}$") &&
+             // Role validation: only admins can set/change roles, or it must be 'user'
+             (isAdmin() || !('role' in data) || data.role == 'user' || (resource != null && data.role == resource.data.role)) &&
+             // Credits validation: only admins can increase credits beyond initial 12
+             (isAdmin() || !('credits' in data) ||
+               (isCreating && data.credits <= maxInitialCredits) || 
+               (!isCreating && (data.credits <= resource.data.credits || data.credits == resource.data.credits + 2))
+             );
+    }
+
+    function isValidChat(data) {
+      return data.keys().hasAll(['userId', 'title', 'createdAt']) &&
+             data.userId == request.auth.uid &&
+             data.title is string && data.title.size() > 0 && data.title.size() < 200;
+    }
+
+    function isValidMessage(data) {
+      return data.keys().hasAll(['role', 'text', 'createdAt']) &&
+             data.role in ['user', 'model'] &&
+             data.text is string && data.text.size() > 0 && data.text.size() < 10000;
+    }
+
+    // ===============================================================
+    // Rules
+    // ===============================================================
+
+    // User profiles
+    match /users/{userId} {
+      // Allow searching for referral codes
+      allow list: if isAuthenticated() && isNotSuspended();
+      allow read: if (isOwner(userId) || isAdmin()) && isNotSuspended();
+      allow create: if isOwner(userId) && isValidUser(request.resource.data);
+      allow update: if (isOwner(userId) || isAdmin()) && isValidUser(request.resource.data) && 
+                    request.resource.data.uid == resource.data.uid;
+      allow delete: if isAdmin();
+    }
+
+    // Referral Rewards
+    match /referral_rewards/{rewardId} {
+      allow read: if isAuthenticated() && isNotSuspended() && (resource.data.toUserId == request.auth.uid || isAdmin());
+      allow create: if isAuthenticated() && isNotSuspended();
+      allow update: if isAuthenticated() && isNotSuspended() && (resource.data.toUserId == request.auth.uid || isAdmin());
+      allow delete: if isAdmin();
+    }
+
+    // Chats
+    match /chats/{chatId} {
+      allow read: if isAuthenticated() && isNotSuspended() && (resource.data.userId == request.auth.uid || isAdmin());
+      allow create: if isAuthenticated() && isNotSuspended() && hasCredits() && isValidChat(request.resource.data);
+      allow update: if isAuthenticated() && isNotSuspended() && (resource.data.userId == request.auth.uid || isAdmin()) && 
+                    isValidChat(request.resource.data) &&
+                    request.resource.data.userId == resource.data.userId;
+      allow delete: if isAuthenticated() && isNotSuspended() && (resource.data.userId == request.auth.uid || isAdmin());
+      
+      // Messages subcollection
+      match /messages/{messageId} {
+        allow read: if isAuthenticated() && isNotSuspended() && (get(/databases/$(database)/documents/chats/$(chatId)).data.userId == request.auth.uid || isAdmin());
+        allow create: if isAuthenticated() && isNotSuspended() && hasCredits() && get(/databases/$(database)/documents/chats/$(chatId)).data.userId == request.auth.uid && 
+                      isValidMessage(request.resource.data);
+      }
+    }
+  }
+}

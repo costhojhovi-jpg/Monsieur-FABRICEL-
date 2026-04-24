@@ -1,0 +1,5 @@
+{
+  "name": "Monsieur FABRICEL",
+  "description": "Enseignant de mathématiques, titulaire d'un Master 2 en Sciences de l'éducation. Expert en didactique, formation des enseignants et intégration des technologies éducatives à Madagascar.",
+  "requestFramePermissions": ["microphone"]
+}
