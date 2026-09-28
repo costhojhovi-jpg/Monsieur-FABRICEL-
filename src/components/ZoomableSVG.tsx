@@ -12,8 +12,43 @@ export const ZoomableSVG = ({ svgCode }: ZoomableSVGProps) => {
   const [isFullScreen, setIsFullScreen] = useState(false);
   const fullScreenRef = useRef<HTMLDivElement>(null);
 
+  // Normalize SVG backgrounds and white text/labels so they are fully visible on the white-themed card background
+  const processedSvgCode = svgCode
+    // Replace dark backgrounds (such as #1e293b, #0f172a, etc.) with transparent "none"
+    .replace(/fill\s*=\s*["']#(1e293b|0f172a|111827|1f2937|1a202c|2d3748|111|334155|0d0d0d|262626|1b1b1b|2e2e2e|1a1a1a)["']/gi, 'fill="none"')
+    .replace(/fill:\s*#(1e293b|0f172a|111827|1f2937|1a202c|2d3748|111|334155|0d0d0d|262626|1b1b1b|2e2e2e|1a1a1a)/gi, 'fill:none')
+    // Process style element tags
+    .replace(/<style([\s\S]*?)<\/style>/gi, (styleMatch) => {
+      return styleMatch
+        .replace(/fill\s*:\s*(?:white|#fff(?:fff)?|#f[89a-f][89a-f][89a-f][89a-f][89a-f]);?/gi, 'fill:#0f172a;')
+        .replace(/color\s*:\s*(?:white|#fff(?:fff)?|#f[89a-f][89a-f][89a-f][89a-f][89a-f]);?/gi, 'color:#0f172a;')
+        .replace(/stroke\s*:\s*(?:white|#fff(?:fff)?|#f[89a-f][89a-f][89a-f][89a-f][89a-f]);?/gi, 'stroke:#0f172a;');
+    })
+    // Ensure all <text> elements with light/white fills are changed to high contrast dark slate
+    .replace(/<text([\s\S]*?)<\/text>/gi, (textMatch) => {
+      return textMatch
+        .replace(/fill\s*=\s*["'](?:white|#fff(?:fff)?|#f[89a-f][89a-f][89a-f][89a-f][89a-f])["']/gi, 'fill="#0f172a"')
+        .replace(/stroke\s*=\s*["'](?:white|#fff(?:fff)?|#f[89a-f][89a-f][89a-f][89a-f][89a-f])["']/gi, 'stroke="none"')
+        .replace(/fill\s*:\s*(?:white|#fff(?:fff)?|#f[89a-f][89a-f][89a-f][89a-f][89a-f]);?/gi, 'fill:#0f172a;')
+        .replace(/stroke\s*:\s*(?:white|#fff(?:fff)?|#f[89a-f][89a-f][89a-f][89a-f][89a-f]);?/gi, 'stroke:none;');
+    })
+    // Target any <tspan> elements with light/white fills
+    .replace(/<tspan([\s\S]*?)<\/tspan>/gi, (tspanMatch) => {
+      return tspanMatch
+        .replace(/fill\s*=\s*["'](?:white|#fff(?:fff)?|#f[89a-f][89a-f][89a-f][89a-f][89a-f])["']/gi, 'fill="#0f172a"')
+        .replace(/stroke\s*=\s*["'](?:white|#fff(?:fff)?|#f[89a-f][89a-f][89a-f][89a-f][89a-f])["']/gi, 'stroke="none"')
+        .replace(/fill\s*:\s*(?:white|#fff(?:fff)?|#f[89a-f][89a-f][89a-f][89a-f][89a-f]);?/gi, 'fill:#0f172a;')
+        .replace(/stroke\s*:\s*(?:white|#fff(?:fff)?|#f[89a-f][89a-f][89a-f][89a-f][89a-f]);?/gi, 'stroke:none;');
+    })
+    // Support groups (<g>) defining white/light fills or strokes
+    .replace(/<g([^>]*?)(fill|stroke)\s*=\s*["'](?:white|#fff(?:fff)?|#f[89a-f][89a-f][89a-f][89a-f][89a-f])["']/gi, (gMatch) => {
+      return gMatch
+        .replace(/fill\s*=\s*["'](?:white|#fff(?:fff)?|#f[89a-f][89a-f][89a-f][89a-f][89a-f])["']/gi, 'fill="#0f172a"')
+        .replace(/stroke\s*=\s*["'](?:white|#fff(?:fff)?|#f[89a-f][89a-f][89a-f][89a-f][89a-f])["']/gi, 'stroke="#0f172a"');
+    });
+
   const downloadSVG = () => {
-    const svgBlob = new Blob([svgCode], { type: "image/svg+xml;charset=utf-8" });
+    const svgBlob = new Blob([processedSvgCode], { type: "image/svg+xml;charset=utf-8" });
     const svgUrl = URL.createObjectURL(svgBlob);
     const downloadLink = document.createElement("a");
     downloadLink.href = svgUrl;
@@ -38,8 +73,8 @@ export const ZoomableSVG = ({ svgCode }: ZoomableSVGProps) => {
           </Button>
         </div>
         <div 
-          className="w-full overflow-x-auto flex justify-center"
-          dangerouslySetInnerHTML={{ __html: svgCode }}
+          className="w-full overflow-x-auto flex justify-center [&>svg]:max-w-full [&>svg]:h-auto [&>svg]:block [&>svg]:mx-auto [&>svg]:min-w-[200px]"
+          dangerouslySetInnerHTML={{ __html: processedSvgCode }}
         />
       </div>
 
@@ -137,8 +172,8 @@ export const ZoomableSVG = ({ svgCode }: ZoomableSVGProps) => {
                       >
                         <div 
                           ref={fullScreenRef} 
-                          className="p-10"
-                          dangerouslySetInnerHTML={{ __html: svgCode }}
+                          className="p-10 w-full h-full flex items-center justify-center [&>svg]:max-w-full [&>svg]:max-h-[75vh] [&>svg]:w-auto [&>svg]:h-auto [&>svg]:block [&>svg]:mx-auto"
+                          dangerouslySetInnerHTML={{ __html: processedSvgCode }}
                         />
                       </TransformComponent>
                     </>

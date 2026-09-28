@@ -42,12 +42,40 @@
         "createdAt": { "type": "string", "format": "date-time" }
       },
       "required": ["chatId", "role", "text", "createdAt"]
+    },
+    "SavedPDF": {
+      "title": "SavedPDF",
+      "description": "A PDF document configuration saved for offline reading and syncing",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string" },
+        "userId": { "type": "string" },
+        "filename": { "type": "string" },
+        "messageText": { "type": "string" },
+        "themeHex": { "type": "string" },
+        "config": {
+          "type": "object",
+          "properties": {
+            "finalDocType": { "type": "string" },
+            "finalSubject": { "type": "string" },
+            "finalGrade": { "type": "string" },
+            "finalIncludeAvatar": { "type": "boolean" },
+            "pdfEnableWatermark": { "type": "boolean" }
+          }
+        },
+        "createdAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["userId", "filename", "messageText", "createdAt"]
     }
   },
   "firestore": {
     "/users/{userId}": {
       "schema": "User",
       "description": "User profiles"
+    },
+    "/saved_pdfs/{pdfId}": {
+      "schema": "SavedPDF",
+      "description": "Saved PDF document configurations for offline use and syncing"
     },
     "/chats/{chatId}": {
       "schema": "Chat",
@@ -56,6 +84,10 @@
     "/chats/{chatId}/messages/{messageId}": {
       "schema": "Message",
       "description": "Messages within a chat"
+    },
+    "/test/{docId}": {
+      "schema": "TestConnection",
+      "description": "Health check document"
     }
   }
 }

@@ -9,10 +9,22 @@ interface ChatInputProps {
   onStop: () => void;
   isLoading: boolean;
   themeStyles: any;
+  isWideLayout?: boolean;
+  externalValue?: string;
+  onExternalValueConsumed?: () => void;
 }
 
-export const ChatInput = React.memo(({ onSend, onStop, isLoading, themeStyles }: ChatInputProps) => {
+export const ChatInput = React.memo(({ onSend, onStop, isLoading, themeStyles, isWideLayout, externalValue, onExternalValueConsumed }: ChatInputProps) => {
   const [input, setInput] = useState("");
+
+  React.useEffect(() => {
+    if (externalValue) {
+      setInput(externalValue);
+      if (onExternalValueConsumed) {
+        onExternalValueConsumed();
+      }
+    }
+  }, [externalValue, onExternalValueConsumed]);
   const [attachments, setAttachments] = useState<{ file: File, preview: string, base64: string, type: string }[]>([]);
   const [error, setError] = useState<string | null>(null);
   const [isListening, setIsListening] = useState(false);
@@ -178,7 +190,7 @@ export const ChatInput = React.memo(({ onSend, onStop, isLoading, themeStyles }:
 
   return (
     <div className="p-6 bg-white border-t border-slate-200 shrink-0">
-      <div className="max-w-5xl mx-auto relative">
+      <div className={cn("mx-auto relative transition-all duration-300", isWideLayout ? "max-w-[95%] xl:max-w-[98%] w-full" : "max-w-5xl")}>
         {/* Error Message */}
         {error && (
           <div className="mb-3 p-2 bg-red-50 border border-red-100 rounded-xl text-red-600 text-[10px] flex items-center justify-between">
@@ -196,7 +208,7 @@ export const ChatInput = React.memo(({ onSend, onStop, isLoading, themeStyles }:
         {attachments.length > 0 && (
           <div className="flex flex-wrap gap-2 mb-3">
             {attachments.map((att, i) => (
-              <div key={i} className="relative group">
+              <div key={`att-item-${att.file?.name || 'file'}-${i}`} className="relative group">
                 <div className="w-16 h-16 rounded-xl border border-slate-200 overflow-hidden bg-slate-50 flex items-center justify-center">
                   {att.type.startsWith('image/') ? (
                     <img src={att.preview} alt="preview" className="w-full h-full object-cover" />

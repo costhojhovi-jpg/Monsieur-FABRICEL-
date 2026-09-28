@@ -5,3 +5,10 @@ coverage/
 *.log
 .env*
 !.env.example
+dist/
+*.before-*
+
+.firebase/
+*.backup
+*.backup-*
+*.encoding-*

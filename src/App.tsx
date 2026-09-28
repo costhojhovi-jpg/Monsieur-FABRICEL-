@@ -1,4 +1,4 @@
-import React, { useState, useRef, useEffect, memo, useCallback } from "react";
+﻿import React, { useState, useRef, useEffect, memo, useCallback } from "react";
 import { 
   Send, 
   BookOpen, 
@@ -32,7 +32,15 @@ import {
   Download,
   File as FileIcon,
   ShieldAlert,
-  Ban
+  Ban,
+  Smartphone,
+  Maximize2,
+  Minimize2,
+  ChevronDown,
+  ChevronUp,
+  WifiOff,
+  Eye,
+  Sparkles
 } from "lucide-react";
 import { motion, AnimatePresence } from "motion/react";
 import ReactMarkdown from "react-markdown";
@@ -46,18 +54,25 @@ import { ScrollArea } from "@/components/ui/scroll-area";
 import { Avatar, AvatarFallback, AvatarImage } from "@/components/ui/avatar";
 import { Badge } from "@/components/ui/badge";
 import { Separator } from "@/components/ui/separator";
-import { chatWithGeminiStream, Message } from "@/services/geminiService";
+import { Message, generateDidacticFallback } from "@/services/geminiService";
+import { aiService } from "@/services/ai/AIService";
 import { cn } from "@/lib/utils";
 import { Mermaid } from "@/components/Mermaid";
 import { ZoomableSVG } from "@/components/ZoomableSVG";
+import { normalizeSvgContent } from "@/utils/svgUtils";
+import { OfficialPacksModal } from "@/components/OfficialPacksModal";
+import { GoogleDriveExportModal } from "@/components/GoogleDriveExportModal";
+import { setCachedAccessToken } from "@/services/googleDriveService";
 import { ChatInput } from "@/components/ChatInput";
-import { jsPDF } from "jspdf";
-import "jspdf-autotable";
-import html2canvas from "html2canvas";
+import { downloadMessageAsPDF } from "@/utils/pdfGenerator";
+import { downloadMessageAsDOCX } from "@/utils/docxGenerator";
+import { downloadAsLaTeXFile } from "@/utils/latexExporter";
+import { stripConversationalFiller } from "@/utils/textUtils";
 import { 
   auth, 
   db, 
   googleProvider, 
+  GoogleAuthProvider,
   signInWithPopup, 
   signOut, 
   onAuthStateChanged, 
@@ -77,17 +92,41 @@ import {
   User,
   createUserWithEmailAndPassword,
   signInWithEmailAndPassword,
+  signInAnonymously,
   updateProfile,
   sendPasswordResetEmail,
   handleFirestoreError,
   OperationType
 } from "@/lib/firebase";
 
+const KATEX_MACROS = {
+  "\\textperthousand": "‰",
+  "\\textpercent": "%",
+  "\\overparen": "\\wideparen",
+  "\\bbox": "\\boxed",
+};
+
 interface ChatSession {
   id: string;
   title: string;
   createdAt: any;
   updatedAt: any;
+}
+
+interface SavedPDF {
+  id: string;
+  userId?: string;
+  filename: string;
+  messageText: string;
+  themeHex: string;
+  config: {
+    finalDocType: string;
+    finalSubject: string;
+    finalGrade: string;
+    finalIncludeAvatar: boolean;
+    pdfEnableWatermark: boolean;
+  };
+  createdAt: number;
 }
 
 class ErrorBoundary extends React.Component<{ children: React.ReactNode }, { hasError: boolean, error: any }> {
@@ -139,55 +178,1053 @@ const THEME_COLORS = [
   { name: "Personnalisé", value: "custom", bg: "", text: "", hex: "", border: "", hover: "", light: "", shadow: "" },
 ];
 
+const wrapRawSvgs = (text: string): string => {
+  if (!text) return "";
+  
+  // 1. Convert any \begin{svg} ... \end{svg} into ```svg ... ```
+  let result = text.replace(/\\begin\{svg\}([\s\S]*?)\\end\{svg\}/gi, (_match, innerContent) => {
+    const normalized = normalizeSvgContent(innerContent);
+    return `\n\`\`\`svg\n${normalized}\n\`\`\`\n`;
+  });
+
+  // 2. Wrap any raw <svg ... </svg> not already enclosed in a code block
+  let transformed = "";
+  let currentIndex = 0;
+  
+  while (currentIndex < result.length) {
+    const svgStart = result.indexOf("<svg", currentIndex);
+    if (svgStart === -1) {
+      transformed += result.substring(currentIndex);
+      break;
+    }
+    
+    const textBefore = result.substring(0, svgStart);
+    const backtickCount = (textBefore.match(/```/g) || []).length;
+    const isInsideCodeBlock = backtickCount % 2 === 1;
+    
+    const svgEnd = result.indexOf("</svg>", svgStart);
+    if (svgEnd === -1) {
+      transformed += result.substring(currentIndex);
+      break;
+    }
+    
+    const nextIndex = svgEnd + 6; // length of "</svg>"
+    
+    if (isInsideCodeBlock) {
+      transformed += result.substring(currentIndex, nextIndex);
+    } else {
+      const svgContent = result.substring(svgStart, nextIndex);
+      const prefixText = result.substring(currentIndex, svgStart);
+      transformed += prefixText;
+      const normalized = normalizeSvgContent(svgContent);
+      transformed += `\n\`\`\`svg\n${normalized}\n\`\`\`\n`;
+    }
+    
+    currentIndex = nextIndex;
+  }
+  
+  return transformed;
+};
+
+let _htmlNodeCounter = 0;
+const getUniqueHtmlKey = (prefix: string, index?: number): string => {
+  if (index !== undefined) {
+    return `${prefix}-${index}`;
+  }
+  _htmlNodeCounter = (_htmlNodeCounter + 1) % 100000000;
+  return `${prefix}-${_htmlNodeCounter}`;
+};
+
+const parseHtmlToReact = (text: string): React.ReactNode => {
+  if (!text) return "";
+  
+  // Basic HTML entity decoding for tags that might have been escaped by the markdown processor
+  const decodedText = text
+    .replace(/&lt;/g, "<")
+    .replace(/&gt;/g, ">")
+    .replace(/&amp;/g, "&")
+    .replace(/&quot;/g, '"')
+    .replace(/&nbsp;/g, " ");
+
+  // Quick check: if there are no HTML tags, just return the text
+  if (!decodedText.includes("<") || !decodedText.includes(">")) {
+    return text;
+  }
+  
+  // Simple regex tokenizer for tags and text
+  const tagRegex = /(<\/?[a-zA-Z0-9_-]+(?:\s*\/?)>)/g;
+  const parts = decodedText.split(tagRegex);
+  
+  const stack: { tag: string; children: any[] }[] = [{ tag: "root", children: [] }];
+  
+  for (const part of parts) {
+    if (!part) continue;
+    
+    if (part.startsWith("<") && part.endsWith(">")) {
+      const cleanTag = part.replace(/[<>]/g, "").trim().toLowerCase();
+      
+      if (cleanTag.startsWith("/")) {
+        // Closing tag
+        const closingTagName = cleanTag.slice(1).trim();
+        // Pop matching tags from stack
+        if (stack.length > 1 && stack[stack.length - 1].tag === closingTagName) {
+          const finished = stack.pop()!;
+          const parent = stack[stack.length - 1];
+          
+          // Map tag to React element
+          let el: React.ReactNode = null;
+          const key = getUniqueHtmlKey(`el-${closingTagName}`);
+          
+          if (finished.tag === "ul") {
+            el = <ul key={key} className="list-disc pl-5 my-1 space-y-0.5">{finished.children}</ul>;
+          } else if (finished.tag === "ol") {
+            el = <ol key={key} className="list-decimal pl-5 my-1 space-y-0.5">{finished.children}</ol>;
+          } else if (finished.tag === "li") {
+            el = <li key={key} className="my-0.5">{finished.children}</li>;
+          } else if (finished.tag === "strong" || finished.tag === "b") {
+            el = <strong key={key} className="font-bold">{finished.children}</strong>;
+          } else if (finished.tag === "em" || finished.tag === "i") {
+            el = <em key={key} className="italic">{finished.children}</em>;
+          } else if (finished.tag === "u") {
+            el = <u key={key} className="underline">{finished.children}</u>;
+          } else if (finished.tag === "p") {
+            el = <p key={key} className="my-1">{finished.children}</p>;
+          } else {
+            // Fallback for unknown tag
+            el = <span key={key}>{finished.children}</span>;
+          }
+          parent.children.push(el);
+        } else {
+          // Unmatched close tag, ignore or treat as text
+          stack[stack.length - 1].children.push(part);
+        }
+      } else if (cleanTag.endsWith("/")) {
+        // Self-closing tag (like <br />)
+        const tagName = cleanTag.slice(0, -1).trim();
+        const parent = stack[stack.length - 1];
+        const key = getUniqueHtmlKey(`sc-${tagName}`);
+        
+        if (tagName === "br") {
+          parent.children.push(<br key={key} />);
+        } else {
+          parent.children.push(<span key={key} />);
+        }
+      } else {
+        // Opening tag
+        const tagName = cleanTag.split(/\s+/)[0];
+        if (tagName === "br") {
+          // Sometimes people write <br> instead of <br />
+          const parent = stack[stack.length - 1];
+          const key = getUniqueHtmlKey("sc-br");
+          parent.children.push(<br key={key} />);
+        } else {
+          stack.push({ tag: tagName, children: [] });
+        }
+      }
+    } else {
+      // Plain text
+      // Unescape some standard HTML entities if present
+      let decodedPart = part
+        .replace(/&nbsp;/g, " ")
+        .replace(/&lt;/g, "<")
+        .replace(/&gt;/g, ">")
+        .replace(/&amp;/g, "&")
+        .replace(/&quot;/g, '"');
+      stack[stack.length - 1].children.push(decodedPart);
+    }
+  }
+  
+  // If stack has items unclosed, pop them back down to root
+  while (stack.length > 1) {
+    const finished = stack.pop()!;
+    const parent = stack[stack.length - 1];
+    const key = getUniqueHtmlKey("unclosed");
+    parent.children.push(<React.Fragment key={key}>{finished.children}</React.Fragment>);
+  }
+  
+  if (stack[0].children.length === 1 && typeof stack[0].children[0] === 'string') {
+    return stack[0].children[0];
+  }
+  
+  return stack[0].children.map((child, idx) => {
+    if (React.isValidElement(child)) {
+      return React.cloneElement(child, { key: child.key || getUniqueHtmlKey(`html-el-${idx}`) });
+    }
+    return <React.Fragment key={getUniqueHtmlKey(`html-txt-${idx}`)}>{child}</React.Fragment>;
+  });
+};
+
+const replaceHtmlBreaks = (node: any): any => {
+  if (typeof node === 'string') {
+    return parseHtmlToReact(node);
+  }
+  if (Array.isArray(node)) {
+    const result: any[] = [];
+    React.Children.toArray(node).forEach((child: any, i) => {
+      const processed = replaceHtmlBreaks(child);
+      if (Array.isArray(processed)) {
+        processed.forEach((item, j) => {
+          if (React.isValidElement(item)) {
+            const uniqueKey = getUniqueHtmlKey(`rhb-arr-${i}-${j}`);
+            result.push(React.cloneElement(item, { key: uniqueKey }));
+          } else {
+            result.push(<React.Fragment key={getUniqueHtmlKey(`rhb-txt-${i}-${j}`)}>{item}</React.Fragment>);
+          }
+        });
+      } else if (React.isValidElement(processed)) {
+        const uniqueKey = getUniqueHtmlKey(`rhb-el-${i}`);
+        result.push(React.cloneElement(processed, { key: uniqueKey }));
+      } else {
+        result.push(processed);
+      }
+    });
+    return result;
+  }
+  if (node && typeof node === 'object' && node.props) {
+    if (node.props.children) {
+      return React.cloneElement(node, {
+        ...node.props,
+        children: replaceHtmlBreaks(node.props.children)
+      });
+    }
+  }
+  return node;
+};
+
+const formatMathBlocks = (text: string): string => {
+  if (!text) return "";
+  
+  // Park any fenced code blocks (like ```svg, ```mermaid, etc.) so math parsing never touches them
+  const codeBlocks: string[] = [];
+  let formatted = text.replace(/```[\s\S]*?```/g, (match) => {
+    const token = `___FMB_CODE_BLOCK_${codeBlocks.length}___`;
+    codeBlocks.push(match);
+    return token;
+  });
+
+  // Convert unsupported MathJax \bbox[...] or \bbox{...} to standard KaTeX \boxed{...}
+  formatted = formatted.replace(/\\bbox\s*(\[[^\]]*\])?\s*\{/g, '\\boxed{');
+  formatted = formatted.replace(/\\bbox\s*(\[[^\]]*\])?/g, '\\boxed');
+
+  // Normalize smart quotes in LaTeX text blocks
+  formatted = formatted.replace(/\\text\s*\{\s*[“"]\s*([^”"]+?)\s*[”"]\s*\}/g, '\\text{"$1"}');
+  
+  // A. Protect / clear emphasis decorators wrapping math environments or block/inline math
+  formatted = formatted.replace(/\*\*(\s*\\begin\{[a-zA-Z*]+\}[\s\S]*?\\end\{[a-zA-Z*]+\}\s*)\*\*/g, "$1");
+  formatted = formatted.replace(/_(\s*\\begin\{[a-zA-Z*]+\}[\s\S]*?\\end\{[a-zA-Z*]+\}\s*)_/g, "$1");
+  formatted = formatted.replace(/\*\*(\s*\$\$[\s\S]*?\$\$\s*)\*\*/g, "$1");
+  formatted = formatted.replace(/_(\s*\$\$[\s\S]*?\$\$\s*)_/g, "$1");
+  formatted = formatted.replace(/\*\*(\s*\$[^$\n]+?\$\s*)\*\*/g, "$1");
+  formatted = formatted.replace(/_(\s*\$[^$\n]+?\$\s*)_/g, "$1");
+
+  // B. Auto-close unclosed mathematical environments (like aligned, align, matrix, cases, array, gather)
+  const environmentsToClose = ["aligned", "align", "matrix", "cases", "array", "gather"];
+  environmentsToClose.forEach(env => {
+    const beginMatches = formatted.match(new RegExp(`\\\\begin\\{${env}\\}`, 'g')) || [];
+    const endMatches = formatted.match(new RegExp(`\\\\end\\{${env}\\}`, 'g')) || [];
+    if (beginMatches.length > endMatches.length) {
+      const diff = beginMatches.length - endMatches.length;
+      for (let i = 0; i < diff; i++) {
+        formatted += `\n\\end{${env}}`;
+      }
+    }
+  });
+  
+  // 1. Pre-process LaTeX environment blocks (like aligned, matrix, cases, array, align) to be enclosed in $$ ... $$
+  const environments = ["aligned", "align", "align\\*", "matrix", "cases", "array", "gather", "gather\\*"];
+  environments.forEach(env => {
+    // This regex matches the environment and optionally captures surrounding $$ or $ delimiters if they exist!
+    const regex = new RegExp(`(\\$\\$|\\$)?\\s*\\\\begin\\{(${env})\\}([\\s\\S]*?)\\\\end\\{\\2\\}\\s*(\\$\\$|\\$)?`, 'g');
+    formatted = formatted.replace(regex, (match, openDelim, envName, body, closeDelim) => {
+      const cleanBody = body.trim();
+      return `\n\n$$\n\\begin{${envName}}\n${cleanBody}\n\\end{${envName}}\n$$\n\n`;
+    });
+  });
+
+  // 2. Detect and recover block-style math equations that are missing delimiters or have unbalanced delimiters
+  let lines = formatted.split('\n');
+  let insideBlockMath = false;
+  let insideEnvironment = false;
+
+  lines = lines.map(line => {
+    const trimmed = line.trim();
+    
+    // Toggle block math state
+    if (trimmed.startsWith('$$')) {
+      insideBlockMath = !insideBlockMath;
+      return line;
+    }
+    
+    // Toggle environment state
+    if (trimmed.startsWith('\\begin{')) {
+      insideEnvironment = true;
+      return line;
+    }
+    if (trimmed.startsWith('\\end{')) {
+      insideEnvironment = false;
+      return line;
+    }
+    
+    // If inside an existing mathematical block or math environment, do not apply single-line auto-wrapping
+    if (insideBlockMath || insideEnvironment) {
+      return line;
+    }
+    
+    if (!trimmed) return line;
+    
+    // Fix unbalanced ending $$ (e.g. formula $$)
+    if (trimmed.endsWith('$$') && !trimmed.startsWith('$$')) {
+      const inside = trimmed.substring(0, trimmed.length - 2).trim();
+      return `\n\n$$\n${inside}\n$$\n\n`;
+    }
+    // Fix unbalanced starting $$ (e.g. $$ formula)
+    if (trimmed.startsWith('$$') && !trimmed.endsWith('$$') && !trimmed.substring(2).includes('$$')) {
+      const inside = trimmed.substring(2).trim();
+      return `\n\n$$\n${inside}\n$$\n\n`;
+    }
+    
+    // Auto-detect equations on their own lines containing common LaTeX syntax but lacking any delimiters
+    const hasMathSymbols = /\\(bbox|boxed|lim|infty|frac|times|dots|bar|sum|mu|sigma|alpha|beta|theta|pi|approx|rightarrow|implies|text|mathcal|mathbb|mathbf|sqrt|overparen|wideparen|pm|quad|qquad|left|right)\b/i.test(trimmed) || /^\\[a-zA-Z]+/i.test(trimmed);
+    const hasEquals = trimmed.includes('=');
+    const hasDelimiters = trimmed.includes('$');
+    
+    if (hasMathSymbols && !hasDelimiters && !trimmed.includes('|')) {
+      return `\n\n$$\n${trimmed}\n$$\n\n`;
+    }
+    
+    return line;
+  });
+  formatted = lines.join('\n');
+  
+  // 3. Format block math: $$ ... $$
+  formatted = formatted.replace(/\$\$([\s\S]*?)\$\$/g, (match, content) => {
+    let cleanContent = content.trim();
+    
+    // Replace any <br> inside math blocks with \\
+    cleanContent = cleanContent.replace(/<br\s*\/?>/gi, " \\\\ ");
+    
+    // Normalize unescaped single backslash followed by whitespace/newline to double backslashes \\
+    cleanContent = cleanContent.replace(/(?<!\\)\\_?(?!\s*\\|[a-zA-Z])(?=\s)/g, " \\\\ ");
+    cleanContent = cleanContent.replace(/(?<!\\)\\(?!\s*\\|[a-zA-Z])(?=\s)/g, " \\\\ ");
+    
+    // Escape unescaped percent sign % inside KaTeX/math to avoid commenting out the rest of the formula
+    cleanContent = cleanContent.replace(/(?<!\\)%/g, "\\%");
+    
+    // Preserve LaTeX newlines \\ by doubling them to \\\\ for markdown escape preservation
+    cleanContent = cleanContent.replace(/\\\\(?!\s*\\)/g, "\\\\\\\\");
+    
+    // Preserve LaTeX spacing \, by doubling to \\,
+    cleanContent = cleanContent.replace(/\\,(?!\s*,)/g, "\\\\,");
+    
+    // Ensure $$ are strictly on their own line with spacing
+    return `\n\n$$\n${cleanContent}\n$$\n\n`;
+  });
+
+  // 4. Format inline math: $ ... $
+  // Matches any $ block that doesn't span lines, doesn't contain space right after/before $, 
+  // and is not plain money/number like $10 or $5,000 or currency values.
+  formatted = formatted.replace(/(?<!\$)\$([^$\n]+?)\$(?!\$)/g, (match, content) => {
+    if (/^\s*\d+[\d\s,.]*\s*$/.test(content) || content.toLowerCase().includes("ar") || content.toLowerCase().includes("fmg")) {
+      return match;
+    }
+    
+    let cleanContent = content;
+    // Escape % inside inline math too
+    cleanContent = cleanContent.replace(/(?<!\\)%/g, "\\%");
+    cleanContent = cleanContent.replace(/\\\\/g, "\\\\\\\\");
+    cleanContent = cleanContent.replace(/\\,/g, "\\\\,");
+    
+    return `$${cleanContent}$`;
+  });
+
+  // Restore parked code blocks
+  codeBlocks.forEach((block, idx) => {
+    formatted = formatted.replace(`___FMB_CODE_BLOCK_${idx}___`, block);
+  });
+  
+  return formatted;
+};
+
 const sanitizeMarkdown = (text: string) => {
   if (!text) return "";
   
-  // First, handle the question formatting: ensure a newline after 1), a), etc.
-  // This regex looks for lines starting with a number or letter followed by ) or .
-  // and then some text on the same line.
-  let processedText = text.split('\n').map(line => {
-    // Match patterns like "1) Text" or "a) Text" or "1. Text"
-    // We exclude cases where it's already followed by a newline or is just the marker
-    const questionMatch = line.match(/^(\s*([0-9]+|[a-z])[\).]\s+)(.+)$/i);
-    if (questionMatch) {
-      return `${questionMatch[1]}\n${questionMatch[3]}`;
+  // 1. Pre-process to fix tables with list prefixes (e.g., "4. | Classes...") or introductory text prior to the table
+  // If a line starts with a list marker or introductory text ending with a colon, separate it with a newline.
+  let preProcessedText = text.replace(/^(\s*\d+[.)]\s*|\s*[-*+]\s*|[^|\n\s][^|\n]*?:\s*)(\|)/gm, '$1\n$2');
+
+  // 2. Pre-process to fix actually collapsed separate table rows while keeping standard empty cells intact.
+  // We only replace double-pipes without space "||" that are commonly used by models to join separate lines.
+  let lines = preProcessedText.split('\n');
+  lines = lines.map(line => {
+    const pipeCount = (line.match(/\|/g) || []).length;
+    if (pipeCount >= 8 && line.includes("||")) {
+      return line.replace(/\|\|/g, "|\n|");
     }
     return line;
-  }).join('\n');
+  });
+  preProcessedText = lines.join('\n');
 
-  // Fix absolute value pipes inside tables
-  // This looks for lines that look like table rows and have math blocks with pipes
-  return processedText.split('\n').map(line => {
+  // 3. Fix absolute value pipes inside table rows first, before extracting placeholders
+  lines = preProcessedText.split('\n');
+  lines = lines.map(line => {
     const trimmed = line.trim();
     if (trimmed.startsWith('|') && trimmed.includes('$')) {
-      // It's likely a table row or header. We need to escape | inside $...$
       return line.replace(/\$([^$]+)\$/g, (match, math) => {
-        // Only escape if it's not already escaped
         return `$${math.replace(/(?<!\\)\|/g, '\\|')}$`;
       });
     }
     return line;
-  }).join('\n');
+  });
+  const textWithTablePipesFixed = lines.join('\n');
+  
+  // 4. Wrap raw SVGs and convert \begin{svg}...\end{svg} FIRST so math parsing never interferes
+  const wrappedText = wrapRawSvgs(textWithTablePipesFixed);
+
+  // 5. Now format math blocks (which safely protects all fenced code blocks)
+  const mathFormat = formatMathBlocks(wrappedText);
+  
+  // 6. Extract and protect (park) code blocks, block math, and inline math
+  const placeholders: string[] = [];
+  let processedText = mathFormat;
+  
+  // Matches all fenced code blocks (like ```mermaid, ```svg etc)
+  // Matches all double-dollar block math $$ ... $$
+  // Matches all single-dollar inline math $ ... $
+  const blockRegex = /(```[\s\S]*?```|\$\$[\s\S]*?\$\$|\$(?!\$)[^$\n]+?\$)/g;
+  
+  processedText = processedText.replace(blockRegex, (match) => {
+    const placeholder = `___CONTAINER_PLACEHOLDER_${placeholders.length}___`;
+    placeholders.push(match);
+    return placeholder;
+  });
+  
+  // 5. Perform standard substitutions on the text OUTSIDE of code/math blocks
+  // We process line-by-line to avoid injecting literal newlines into any lines containing pipes ('|'), 
+  // as literal newlines break markdown tables. Markdown tables use '<br>' tags for line breaks instead.
+  const linesArray = processedText.split('\n');
+  const processedLines = linesArray.map(line => {
+    if (line.includes('|')) {
+      return line;
+    }
+    
+    let temp = line;
+    // Standardize existing <br /> and <br> elements as markdown soft breaks (two spaces + newline)
+    temp = temp.replace(/<br\s*\/?>/gi, "  \n");
+
+    // Insert line breaks (two spaces + newline) before inline numbers/letters tightly for list structures
+    temp = temp.replace(/([^\s>#|*=\-_])\s*\n?\s*\b(\d{1,2})([).])\s+/g, '$1  \n$2$3 ');
+    temp = temp.replace(/([^\s>#|*=\-_])\s*\n?\s*\b([IVXLCDM]{1,4})\b([).])\s+/gi, '$1  \n$2$3 ');
+    temp = temp.replace(/([^\s>#|*=\-_])\s*\n?\s*\b([a-hA-H])([).])\s+/g, '$1  \n$2$3 ');
+    
+    return temp;
+  });
+  processedText = processedLines.join('\n');
+
+  // 6. Unpark the placeholders back in reverse order, to avoid nested container parsing issues
+  for (let i = placeholders.length - 1; i >= 0; i--) {
+    processedText = processedText.replace(`___CONTAINER_PLACEHOLDER_${i}___`, placeholders[i]);
+  }
+  
+  return processedText;
 };
 
 // Memoized Message Component for performance
-const ChatMessage = memo(({ message, index, onCopy, copiedId, theme, onSettingsClick }: { 
+const ChatMessage = memo(({ message, index, onCopy, copiedId, theme, onSettingsClick, isWideLayout, onPDFDownloaded }: { 
   message: Message, 
   index: number, 
   onCopy: (text: string, id: number) => void,
   copiedId: number | null,
   theme: any,
-  onSettingsClick: () => void
+  onSettingsClick: () => void,
+  isWideLayout?: boolean,
+  onPDFDownloaded?: (pdf: {
+    filename: string;
+    messageText: string;
+    themeHex: string;
+    config: {
+      finalDocType: string;
+      finalSubject: string;
+      finalGrade: string;
+      finalIncludeAvatar: boolean;
+      pdfEnableWatermark: boolean;
+      pdfIncludeBrandHeader?: boolean;
+      pdfIncludeBrandFooter?: boolean;
+      pdfStripFiller?: boolean;
+    };
+  }) => void;
 }) => {
   const isModel = message.role === "model";
   const messageRef = useRef<HTMLDivElement>(null);
   const [isGeneratingPDF, setIsGeneratingPDF] = useState(false);
 
-  const downloadAsPDF = async () => {
-    if (!messageRef.current) return;
+  // Custom PDF configuration states for Madagascar educators
+  const [isConfigModalOpen, setIsConfigModalOpen] = useState(false);
+  const [isDriveModalOpen, setIsDriveModalOpen] = useState(false);
+  const [exportType, setExportType] = useState<"print" | "pdf" | "docx" | "tex" | "drive">("print");
+  const [pdfDocType, setPdfDocType] = useState("Fiche de préparation de leçon");
+  const [pdfSubject, setPdfSubject] = useState("Mathématiques");
+  const [pdfGrade, setPdfGrade] = useState("Classe de Terminale");
+  const [pdfEnableWatermark, setPdfEnableWatermark] = useState(true);
+  const [pdfIncludeAvatar, setPdfIncludeAvatar] = useState(true);
+  const [pdfIncludeBrandHeader, setPdfIncludeBrandHeader] = useState(true);
+  const [pdfIncludeBrandFooter, setPdfIncludeBrandFooter] = useState(true);
+  const [pdfStripFiller, setPdfStripFiller] = useState(false);
+  
+  const [customDocType, setCustomDocType] = useState("");
+  const [customSubject, setCustomSubject] = useState("");
+  const [customGrade, setCustomGrade] = useState("");
+  const [downloadedPdfInfo, setDownloadedPdfInfo] = useState<{ pdfUrl: string; filename: string } | null>(null);
+  const [downloadedDocxInfo, setDownloadedDocxInfo] = useState<{ docxUrl: string; filename: string } | null>(null);
+
+  const printDiscussionMessage = () => {
     setIsGeneratingPDF(true);
+    const finalDocType = pdfDocType === "Autre" ? (customDocType.trim() || "Fiche Pédagogique") : pdfDocType;
+    const finalSubject = pdfSubject === "Autre" ? (customSubject.trim() || "Multi-disciplines") : pdfSubject;
+    const finalGrade = pdfGrade === "Autre" ? (customGrade.trim() || "Enseignement Général") : pdfGrade;
+
+    const safeTypeLabel = finalDocType.toLowerCase().replace(/[^a-z0-9]/gi, "_");
+    const safeSubjectLabel = finalSubject.toLowerCase().replace(/[^a-z0-9]/gi, "_");
+    const docFilename = `document-fabricel-${safeTypeLabel}-${safeSubjectLabel}-${Date.now().toString().slice(-6)}.pdf`;
+
+    if (onPDFDownloaded) {
+      onPDFDownloaded({
+        filename: docFilename,
+        messageText: message.text,
+        themeHex: theme.hex,
+        config: {
+          finalDocType,
+          finalSubject,
+          finalGrade,
+          finalIncludeAvatar: pdfIncludeAvatar,
+          pdfEnableWatermark,
+          pdfIncludeBrandHeader,
+          pdfIncludeBrandFooter,
+          pdfStripFiller
+        }
+      });
+    }
 
     try {
+      // 1. Remove old print-section if exists
+      let printSection = document.getElementById("print-section");
+      if (printSection) {
+        printSection.remove();
+      }
+      
+      // 2. Create the printing container
+      printSection = document.createElement("div");
+      printSection.id = "print-section";
+
+      // 3. Clone current bubble content
+      const element = messageRef.current;
+      if (!element) return;
+      const contentClone = element.cloneNode(true) as HTMLElement;
+
+      // 4. Remove copy/download buttons and other interactive UI widgets
+      const interactive = contentClone.querySelectorAll("button, .flex.items-center.gap-1.mt-2, .zoom-controls, .copy-button, .transform-controls, .zoom-slider-container, .interactive-controls");
+      interactive.forEach(el => el.remove());
+
+      // If requested, strip conversational fillers from HTML before printing
+      if (pdfStripFiller) {
+        const markdownBody = contentClone.querySelector(".markdown-body") || contentClone;
+        const paragraphs = Array.from(markdownBody.children);
+        
+        // Remove first paragraph if it is typical opening filler
+        if (paragraphs.length > 0) {
+          let checkFirst = true;
+          while (checkFirst && paragraphs.length > 0) {
+            const el = paragraphs[0];
+            const text = el.textContent?.trim().toLowerCase() || "";
+            if (!text) {
+              el.remove();
+              paragraphs.shift();
+              continue;
+            }
+            if (el.tagName === "P" && (
+              text.startsWith("bonjour") ||
+              text.startsWith("salut") ||
+              text.startsWith("certainement") ||
+              text.startsWith("bien sûr") ||
+              text.startsWith("voici") ||
+              text.startsWith("pour cela") ||
+              text.startsWith("je vous propose") ||
+              text.startsWith("je suis ravi") ||
+              text.startsWith("en tant que") ||
+              text.startsWith("en réponse à") ||
+              text.includes("monsieur fabricel")
+            )) {
+              el.remove();
+              paragraphs.shift();
+            } else {
+              checkFirst = false;
+            }
+          }
+        }
+
+        // Remove last paragraph if it is typical closing advice or signature
+        if (paragraphs.length > 0) {
+          let checkLast = true;
+          while (checkLast && paragraphs.length > 0) {
+            const el = paragraphs[paragraphs.length - 1];
+            const text = el.textContent?.trim().toLowerCase() || "";
+            if (!text) {
+              el.remove();
+              paragraphs.pop();
+              continue;
+            }
+            if (el.tagName === "P" && (
+              text.startsWith("j'espère que") ||
+              text.startsWith("n'hésitez pas") ||
+              text.startsWith("bon courage") ||
+              text.startsWith("conseil") ||
+              text.startsWith("conseils") ||
+              text.startsWith("recommandation") ||
+              text.startsWith("note :") ||
+              text.startsWith("remarque :") ||
+              text.startsWith("cordialement") ||
+              text.startsWith("en espérant") ||
+              text.startsWith("si vous avez") ||
+              text.startsWith("bonne préparation") ||
+              text.startsWith("à bientôt")
+            )) {
+              el.remove();
+              paragraphs.pop();
+            } else {
+              checkLast = false;
+            }
+          }
+        }
+      }
+
+      // 5. Create header HTML matching app theme
+      const headerHtml = pdfIncludeBrandHeader ? `
+        <div class="print-header-banner" style="border: 2px solid ${theme.hex};">
+          <div class="print-header-left">
+            ${pdfIncludeAvatar ? `<img src="${BOT_PHOTO_URL}" class="print-avatar" style="border-color: ${theme.hex};" />` : ""}
+            <div class="print-header-brand">
+              <span class="print-brand-name" style="color: ${theme.hex};">MONSIEUR FABRICEL</span>
+              <h1 class="print-doc-type">${finalDocType}</h1>
+              <span class="print-brand-subtitle">Assistant Pédagogique d'Excellence</span>
+            </div>
+          </div>
+          <div class="print-header-meta">
+            <div class="print-meta-line"><strong>Matière:</strong> <span class="print-meta-badge" style="background-color: ${theme.hex}15; color: ${theme.hex};">${finalSubject}</span></div>
+            <div class="print-meta-line"><strong>Classe:</strong> <span class="print-meta-badge" style="background-color: ${theme.hex}15; color: ${theme.hex};">${finalGrade}</span></div>
+            <div class="print-meta-date">Fiche générée le ${new Date().toLocaleDateString("fr-FR")}</div>
+          </div>
+        </div>
+      ` : `
+        <div class="print-header-banner" style="border-bottom: 2px solid ${theme.hex}; border-radius: 0; background: transparent; padding: 12px 0 16px 0; margin-bottom: 20px;">
+          <div class="print-header-left" style="flex: 1;">
+            <div class="print-header-brand">
+              <h1 class="print-doc-type" style="font-size: 22px; margin: 0;">${finalDocType}</h1>
+              <span class="print-brand-subtitle" style="font-size: 11px; margin-top: 4px;">Fiche générée le ${new Date().toLocaleDateString("fr-FR")}</span>
+            </div>
+          </div>
+          <div class="print-header-meta" style="width: auto;">
+            <div class="print-meta-line"><strong>Matière:</strong> <span class="print-meta-badge" style="background-color: ${theme.hex}15; color: ${theme.hex}; font-size: 12px;">${finalSubject}</span></div>
+            <div class="print-meta-line" style="margin-top: 4px;"><strong>Classe:</strong> <span class="print-meta-badge" style="background-color: ${theme.hex}15; color: ${theme.hex}; font-size: 12px;">${finalGrade}</span></div>
+          </div>
+        </div>
+      `;
+
+      // 6. Create A4 Footer
+      const footerHtml = pdfIncludeBrandFooter ? `
+        <div class="print-footer">
+          <div class="print-footer-contact">Monsieur FABRICEL - Assistant Pédagogique d'Excellence  |  Toamasina, Madagascar</div>
+          <div class="print-footer-contact">Contact: +261 38 07 709 73  |  fabricel534@gmail.com</div>
+        </div>
+      ` : `
+        <div class="print-footer" style="border-top: 1px solid #e2e8f0; margin-top: 30px; padding-top: 10px;">
+          <div class="print-footer-contact">Support d'activités - ${finalDocType}</div>
+          <div class="print-footer-contact">Fiche pédagogique</div>
+        </div>
+      `;
+
+      // 7. Watermark element if checked
+      const watermarkHtml = (pdfEnableWatermark && pdfIncludeBrandHeader) ? `
+        <div class="print-watermark">
+          <span>MONSIEUR FABRICEL</span>
+        </div>
+      ` : "";
+
+      // 8. Style for print window
+      const stylesHtml = `
+        <style>
+          @media print {
+            body * {
+              visibility: hidden !important;
+            }
+            #print-section, #print-section * {
+              visibility: visible !important;
+            }
+            #print-section {
+              position: absolute !important;
+              left: 0 !important;
+              top: 0 !important;
+              width: 100% !important;
+              background: white !important;
+              color: #1e293b !important;
+              box-shadow: none !important;
+              margin: 0 !important;
+              padding: 0 !important;
+            }
+            @page {
+              size: A4;
+              margin: 20mm 15mm 20mm 15mm;
+            }
+          }
+
+          #print-section {
+            font-family: 'Inter', -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+            color: #1e293b;
+            line-height: 1.6;
+            font-size: 14px;
+            background: white;
+            padding: 10px;
+          }
+
+          .print-header-banner {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            padding: 16px;
+            margin-bottom: 24px;
+            border-radius: 12px;
+            background-color: #f8fafc;
+            box-sizing: border-box;
+            width: 100%;
+            break-inside: avoid;
+            page-break-inside: avoid;
+          }
+          .print-header-left {
+            display: flex;
+            align-items: center;
+            gap: 16px;
+          }
+          .print-avatar {
+            width: 60px;
+            height: 60px;
+            border-radius: 9999px;
+            border: 2px solid;
+            object-fit: cover;
+          }
+          .print-header-brand {
+            display: flex;
+            flex-direction: column;
+          }
+          .print-brand-name {
+            font-size: 10px;
+            font-weight: 800;
+            text-transform: uppercase;
+            letter-spacing: 1.5px;
+          }
+          .print-doc-type {
+            font-size: 18px;
+            font-weight: 800;
+            color: #0f172a;
+            margin: 4px 0;
+            line-height: 1.2;
+          }
+          .print-brand-subtitle {
+            font-size: 11px;
+            color: #64748b;
+          }
+          .print-header-meta {
+            text-align: right;
+            display: flex;
+            flex-direction: column;
+            gap: 6px;
+          }
+          .print-meta-line {
+            font-size: 12px;
+            color: #334155;
+          }
+          .print-meta-badge {
+            padding: 3px 8px;
+            border-radius: 6px;
+            font-weight: 700;
+            font-size: 11px;
+          }
+          .print-meta-date {
+            font-size: 10px;
+            color: #94a3b8;
+            font-style: italic;
+          }
+
+          .print-footer {
+            border-top: 1px solid #e2e8f0;
+            padding-top: 12px;
+            margin-top: 40px;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            color: #94a3b8;
+            font-size: 9px;
+            break-inside: avoid;
+            page-break-inside: avoid;
+          }
+          .print-footer-contact {
+            font-weight: 500;
+          }
+
+          .print-watermark {
+            position: fixed;
+            top: 0;
+            left: 0;
+            right: 0;
+            bottom: 0;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            pointer-events: none;
+            z-index: -1;
+            opacity: 0.05;
+            overflow: hidden;
+          }
+          .print-watermark span {
+            font-size: 60px;
+            font-weight: 900;
+            color: #475569;
+            transform: rotate(-32deg);
+            letter-spacing: 5px;
+            white-space: nowrap;
+          }
+
+          .print-content {
+            color: #1e293b !important;
+            width: 100% !important;
+            background: transparent !important;
+          }
+          .print-content .prose {
+            max-width: 100% !important;
+            color: #1e293b !important;
+          }
+          .print-content p {
+            color: #1e293b !important;
+            margin-bottom: 12px !important;
+            line-height: 1.6 !important;
+          }
+          
+          .print-content h1, .print-content h2, .print-content h3, .print-content h4 {
+            color: ${theme.hex} !important;
+            font-weight: 700 !important;
+            line-height: 1.3 !important;
+            break-after: avoid;
+            page-break-after: avoid;
+            margin-top: 1.5em !important;
+            margin-bottom: 0.6em !important;
+          }
+          .print-content h1 { font-size: 20px !important; }
+          .print-content h2 { font-size: 16px !important; }
+          .print-content h3 { font-size: 14px !important; }
+
+          .print-content table, 
+          .print-content .mermaid, 
+          .print-content .katex-display, 
+          .print-content blockquote, 
+          .print-content pre,
+          .print-content li,
+          .print-content .math-block {
+            break-inside: avoid !important;
+            page-break-inside: avoid !important;
+          }
+
+          .print-content table {
+            border-collapse: collapse !important;
+            width: 100% !important;
+            margin: 16px 0 !important;
+            font-size: 12px !important;
+          }
+          .print-content th, .print-content td {
+            border: 1px solid #cbd5e1 !important;
+            padding: 8px 10px !important;
+            text-align: left !important;
+            color: #1e293b !important;
+            background: transparent !important;
+          }
+          .print-content th {
+            background-color: #f1f5f9 !important;
+            font-weight: 700 !important;
+          }
+
+          .print-content ul {
+            list-style-type: disc !important;
+            margin-left: 20px !important;
+            padding-left: 0 !important;
+            margin-bottom: 12px !important;
+          }
+          .print-content ol {
+            list-style-type: decimal !important;
+            margin-left: 20px !important;
+            padding-left: 0 !important;
+            margin-bottom: 12px !important;
+          }
+          .print-content li {
+            margin-bottom: 4px !important;
+            display: list-item !important;
+            color: #1e293b !important;
+          }
+
+          .print-content svg {
+            max-width: 100% !important;
+            height: auto !important;
+          }
+          
+          .text-white {
+            color: #1e293b !important;
+          }
+        </style>
+        <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/katex@0.16.8/dist/katex.min.css">
+      `;
+
+      // 9. Assemble everything inside print-section
+      printSection.innerHTML = `
+        ${stylesHtml}
+        ${watermarkHtml}
+        <div style="max-width: 800px; margin: 0 auto; padding: 10px; box-sizing: border-box;">
+          ${headerHtml}
+          <div class="print-content">
+            ${contentClone.innerHTML}
+          </div>
+          ${footerHtml}
+        </div>
+      `;
+
+      // 10. Append printSection temporarily to body
+      document.body.appendChild(printSection);
+
+      // 11. Custom brief timeout before triggering native print
+      setTimeout(() => {
+        window.print();
+        if (printSection) {
+          document.body.removeChild(printSection);
+        }
+        setIsGeneratingPDF(false);
+        setIsConfigModalOpen(false);
+      }, 500);
+
+    } catch (error) {
+      console.error("Impression Directe Error:", error);
+      setIsGeneratingPDF(false);
+    }
+  };
+
+  const handleExportAction = () => {
+    if (exportType === "print") {
+      printDiscussionMessage();
+    } else if (exportType === "docx") {
+      downloadAsDOCX();
+    } else if (exportType === "tex") {
+      downloadAsLaTeX();
+    } else if (exportType === "drive") {
+      setIsConfigModalOpen(false);
+      setIsDriveModalOpen(true);
+    } else {
+      downloadAsPDF();
+    }
+  };
+
+  const downloadAsLaTeX = () => {
+    setIsGeneratingPDF(true);
+    setDownloadedDocxInfo(null);
+    setDownloadedPdfInfo(null);
+    const finalDocType = pdfDocType === "Autre" ? (customDocType.trim() || "Fiche Pédagogique") : pdfDocType;
+    const finalSubject = pdfSubject === "Autre" ? (customSubject.trim() || "Multi-disciplines") : pdfSubject;
+    const finalGrade = pdfGrade === "Autre" ? (customGrade.trim() || "Enseignement Général") : pdfGrade;
+
+    const exportText = pdfStripFiller ? stripConversationalFiller(message.text) : message.text;
+
+    try {
+      downloadAsLaTeXFile(exportText, {
+        title: finalDocType,
+        subject: finalSubject,
+        grade: finalGrade,
+      });
+      setIsGeneratingPDF(false);
+      setIsConfigModalOpen(false);
+    } catch (error) {
+      console.error("LaTeX Export Error:", error);
+      setIsGeneratingPDF(false);
+    }
+  };
+
+  const downloadAsDOCX = async () => {
+    setIsGeneratingPDF(true);
+    setDownloadedDocxInfo(null);
+    setDownloadedPdfInfo(null);
+    const finalDocType = pdfDocType === "Autre" ? (customDocType.trim() || "Fiche Pédagogique") : pdfDocType;
+    const finalSubject = pdfSubject === "Autre" ? (customSubject.trim() || "Multi-disciplines") : pdfSubject;
+    const finalGrade = pdfGrade === "Autre" ? (customGrade.trim() || "Enseignement Général") : pdfGrade;
+
+    const exportText = pdfStripFiller ? stripConversationalFiller(message.text) : message.text;
+
+    try {
+      const result = await downloadMessageAsDOCX(exportText, theme.hex, {
+        finalDocType,
+        finalSubject,
+        finalGrade,
+        finalIncludeAvatar: pdfIncludeAvatar,
+        finalIncludeBrandHeader: pdfIncludeBrandHeader,
+        finalIncludeBrandFooter: pdfIncludeBrandFooter,
+      });
+      setDownloadedDocxInfo(result);
+      setIsGeneratingPDF(false);
+    } catch (error) {
+      console.error("Word Generation Error:", error);
+      setIsGeneratingPDF(false);
+    }
+  };
+
+  const downloadAsPDF = async () => {
+    setIsGeneratingPDF(true);
+    setDownloadedPdfInfo(null);
+    setDownloadedDocxInfo(null);
+    const finalDocType = pdfDocType === "Autre" ? (customDocType.trim() || "Fiche Pédagogique") : pdfDocType;
+    const finalSubject = pdfSubject === "Autre" ? (customSubject.trim() || "Multi-disciplines") : pdfSubject;
+    const finalGrade = pdfGrade === "Autre" ? (customGrade.trim() || "Enseignement Général") : pdfGrade;
+
+    const exportText = pdfStripFiller ? stripConversationalFiller(message.text) : message.text;
+
+    try {
+      const result = await downloadMessageAsPDF(exportText, theme.hex, {
+        finalDocType,
+        finalSubject,
+        finalGrade,
+        finalIncludeAvatar: pdfIncludeAvatar,
+        pdfEnableWatermark,
+        pdfIncludeBrandHeader,
+        pdfIncludeBrandFooter,
+      });
+      setDownloadedPdfInfo(result);
+      if (onPDFDownloaded) {
+        onPDFDownloaded({
+          filename: result.filename,
+          messageText: exportText,
+          themeHex: theme.hex,
+          config: {
+            finalDocType,
+            finalSubject,
+            finalGrade,
+            finalIncludeAvatar: pdfIncludeAvatar,
+            pdfEnableWatermark,
+            pdfIncludeBrandHeader,
+            pdfIncludeBrandFooter,
+            pdfStripFiller
+          }
+        });
+      }
+      setIsGeneratingPDF(false);
+      return; // Clean short-circuit preventing any legacy html2canvas/jsPDF code path
+    } catch (error) {
+      console.error("PDF Generation Error:", error);
+      setIsGeneratingPDF(false);
+      return;
+    }
+
+    try {
+      const finalIncludeAvatar = true;
+      const jsPDF: any = null;
       const element = messageRef.current;
       
       // Create a temporary container for PDF rendering to ensure high quality and correct width
@@ -197,7 +1234,7 @@ const ChatMessage = memo(({ message, index, onCopy, copiedId, theme, onSettingsC
       printContainer.style.left = '0';
       printContainer.style.top = '0';
       printContainer.style.zIndex = '-9999';
-      printContainer.style.width = '700px'; // Reduced width for better fit
+      printContainer.style.width = '800px'; // Set to 800px for robust mobile rendering and page scaling
       printContainer.style.backgroundColor = 'white';
       printContainer.style.opacity = '1';
       printContainer.style.visibility = 'visible';
@@ -212,8 +1249,8 @@ const ChatMessage = memo(({ message, index, onCopy, copiedId, theme, onSettingsC
       const header = document.createElement('div');
       header.innerHTML = `
         <style>
-          html, body { 
-            font-size: 16px !important; 
+          html, body {
+            font-size: 15px !important;
             background: white !important;
             margin: 0 !important;
             padding: 0 !important;
@@ -227,36 +1264,24 @@ const ChatMessage = memo(({ message, index, onCopy, copiedId, theme, onSettingsC
             word-spacing: normal !important;
             font-variant-ligatures: none !important;
           }
-          /* Force a standard font for PDF to avoid character width calculation issues, but exclude KaTeX */
-          body, p, div, span, h1, h2, h3, h4, li:not(.katex *) {
-            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Arial, sans-serif !important;
-            letter-spacing: 0.2px !important;
-            word-spacing: 1px !important;
+          
+          /* Apply standard fonts only to non-math elements. IMPORTANT: DO NOT override .katex elements! */
+          body, p, div:not(.katex *), h1, h2, h3, h4, li:not(.katex *) {
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif !important;
+            letter-spacing: 0.1px !important;
+            word-spacing: 0.5px !important;
           }
-          .katex * {
-            font-family: KaTeX_Main, KaTeX_Math, serif !important;
-            letter-spacing: normal !important;
-            word-spacing: normal !important;
-            display: inline-block !important;
-            font-style: normal !important;
-          }
-          .katex .mord { font-family: KaTeX_Main, serif !important; }
-          .katex .mord.mathnormal { font-family: KaTeX_Math, serif !important; }
-          .katex .msupsub { font-family: KaTeX_Main, serif !important; }
-          .katex-display {
-            display: block !important;
-            margin: 1em 0 !important;
-          }
-          /* Aggressive override to prevent oklch parsing errors in html2canvas */
+
+          /* General styling resets to override OKLCH colors, which crash html2canvas styling */
           :root, * {
             --background: #ffffff !important;
             --foreground: #000000 !important;
-            --tw-prose-body: #334155 !important;
+            --tw-prose-body: #1e293b !important;
             --tw-prose-headings: ${theme.hex} !important;
             --tw-prose-links: ${theme.hex} !important;
             --tw-prose-bold: #0f172a !important;
-            --tw-prose-counters: #64748b !important;
-            --tw-prose-bullets: #cbd5e1 !important;
+            --tw-prose-counters: #475569 !important;
+            --tw-prose-bullets: #94a3b8 !important;
             --tw-prose-hr: #e2e8f0 !important;
             --tw-prose-quotes: #0f172a !important;
             --tw-prose-quote-borders: #e2e8f0 !important;
@@ -280,59 +1305,139 @@ const ChatMessage = memo(({ message, index, onCopy, copiedId, theme, onSettingsC
             --input: #e2e8f0 !important;
             --ring: ${theme.hex} !important;
           }
-          
-          /* Hide KaTeX MathML to prevent double rendering in PDF */
-          .katex-mathml { display: none !important; }
-          .katex-html { display: inline-block !important; }
-          
-          .prose { 
-            color: #334155 !important; 
+
+          /* Extremely robust KaTeX Integration: Preserve standard math rendering styles and special fonts */
+          .katex-mathml {
+            display: none !important;
+          }
+          .katex-html {
+            display: inline-block !important;
+          }
+          .katex {
+            font-size: 1.1em !important;
+            line-height: normal !important;
+            text-rendering: auto !important;
+          }
+          .katex-display {
+            display: block !important;
+            margin: 1.2em 0 !important;
+            text-align: center !important;
+            width: 100% !important;
+            overflow-x: auto !important;
+            overflow-y: hidden !important;
+            padding: 4px 0 !important;
+          }
+          /* Ensure we do NOT apply inline-block or Arial overrides to KaTeX children and force their native math fonts */
+          .katex, .katex * {
+            font-family: KaTeX_Main, KaTeX_Math, KaTeX_Size1, KaTeX_Size2, KaTeX_Size3, KaTeX_Size4, KaTeX_Caligraphic, KaTeX_Size5, KaTeX_SansSerif, KaTeX_Script, KaTeX_Typewriter, serif !important;
+            letter-spacing: normal !important;
+            word-spacing: normal !important;
+            font-style: normal !important;
+          }
+
+          /* Clean, spacious and professional Prose typography */
+          .prose {
+            color: #1e293b !important;
             font-size: 14px !important;
             line-height: 1.6 !important;
+            width: 100% !important;
+            max-width: 100% !important;
           }
-          .prose h1, .prose h2, .prose h3, .prose h4 { 
-            color: ${theme.hex} !important; 
-            margin-top: 1.5em !important;
-            margin-bottom: 0.5em !important;
-          }
-          .prose p { 
-            margin-bottom: 1em !important; 
+          .prose p {
+            margin-top: 0 !important;
+            margin-bottom: 12px !important;
+            line-height: 1.6 !important;
             word-wrap: break-word !important;
             overflow-wrap: break-word !important;
+            text-align: justify !important;
+          }
+          .prose h1, .prose h2, .prose h3, .prose h4 {
+            color: ${theme.hex} !important;
+            font-weight: 700 !important;
+            margin-top: 1.5em !important;
+            margin-bottom: 0.6em !important;
+            line-height: 1.3 !important;
+            break-after: avoid !important;
+            page-break-after: avoid !important;
           }
           
-          table { 
-            border-collapse: collapse !important; 
-            width: 100% !important; 
-            margin: 20px 0 !important; 
+          /* Re-establish high quality lists because Tailwind typography collapses them */
+          .prose ul, .prose ol {
+            margin-top: 8px !important;
+            margin-bottom: 16px !important;
+            padding-left: 12px !important;
+            width: 100% !important;
+            display: block !important;
+          }
+          .prose li {
+            margin-bottom: 6px !important;
+            line-height: 1.6 !important;
+            display: block !important; /* Extremely stable, prevents standard marker offset issues */
+            list-style: none !important; /* Rely entirely on visual prepended prefix icons */
+            color: #1e293b !important;
+          }
+          .prose li li {
+            margin-left: 20px !important; /* Indent sublists beautifully */
+          }
+          .prose strong {
+            color: ${theme.hex} !important;
+            font-weight: 700 !important;
+          }
+
+          /* Improved table styling for PDF structure */
+          table {
+            border-collapse: collapse !important;
+            width: 100% !important;
+            margin: 20px 0 !important;
             table-layout: auto !important;
-            font-size: 12px !important;
+            font-size: 13px !important;
           }
-          th, td { 
-            border: 1px solid #e2e8f0 !important; 
-            padding: 8px !important; 
-            text-align: left !important; 
-            word-break: break-word !important;
-          }
-          th { background-color: #f8fafc !important; }
-          
-          /* Ensure Mermaid diagrams fit horizontally */
-          .mermaid svg { max-width: 100% !important; height: auto !important; }
-          
-          /* Prevent elements from being cut in half across pages */
-          .mermaid-container, table, pre, blockquote, .katex-display, h1, h2, h3, .prose p {
+          tr {
             break-inside: avoid !important;
             page-break-inside: avoid !important;
           }
-          
-          * { 
+          th, td {
+            border: 1px solid #cbd5e1 !important;
+            padding: 8px 10px !important;
+            text-align: left !important;
+            word-break: break-word !important;
+          }
+          th {
+            background-color: #f1f5f9 !important;
+            font-weight: 700 !important;
+          }
+
+          /* Ensure Mermaid diagrams fit horizontally */
+          .mermaid svg {
+            max-width: 100% !important;
+            height: auto !important;
+          }
+
+          /* Avoid partial splitting of key blocks */
+          .mermaid-container, tr, pre, blockquote, .katex-display, h1, h2, h3, h4 {
+            break-inside: avoid !important;
+            page-break-inside: avoid !important;
+          }
+
+          * {
             color-scheme: light !important;
             -webkit-print-color-adjust: exact !important;
           }
         </style>
-        <div style="border-bottom: 2px solid ${theme.hex}; padding-bottom: 10px; margin-bottom: 30px; box-sizing: border-box; width: 100%; overflow: hidden;">
-          <h1 style="color: ${theme.hex}; margin: 0; font-size: 18px; font-weight: bold;">Monsieur FABRICEL - Document Pédagogique</h1>
-          <p style="color: #64748b; margin: 5px 0 0 0; font-size: 10px;">Généré le ${new Date().toLocaleDateString('fr-FR')}</p>
+        <div style="display: flex; align-items: center; justify-content: space-between; border: 2px solid ${theme.hex}; padding: 18px; margin-bottom: 25px; border-radius: 12px; background-color: #f8fafc; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif !important; box-sizing: border-box; width: 100%; overflow: hidden;">
+          <div style="display: flex; align-items: center; gap: 15px;">
+            ${finalIncludeAvatar ? `<img src="${BOT_PHOTO_URL}" style="width: 65px; height: 65px; border-radius: 9999px; border: 2.5px solid ${theme.hex}; object-fit: cover; display: block;" crossOrigin="anonymous" />` : ''}
+            <div>
+              <div style="color: ${theme.hex}; font-size: 11px; font-weight: 850; text-transform: uppercase; letter-spacing: 1.2px; margin-bottom: 3px; font-family: inherit;">Monsieur FABRICEL</div>
+              <div style="font-size: 20px; font-weight: 800; color: #011627; margin-bottom: 3px; line-height: 1.1; font-family: inherit;">${finalDocType}</div>
+              <div style="font-size: 11px; color: #64748b; font-weight: 500; font-family: inherit;">Assistant Pédagogique d'Excellence</div>
+            </div>
+          </div>
+          <div style="text-align: right; display: flex; flex-direction: column; gap: 5px; font-family: inherit;">
+            <div style="font-size: 12px; color: #334155;"><strong style="font-family: inherit;">Matière :</strong> <span style="background-color: ${theme.hex}15; color: ${theme.hex}; padding: 3px 8px; border-radius: 6px; font-weight: 700; font-size: 11px; font-family: inherit;">${finalSubject}</span></div>
+            <div style="font-size: 12px; color: #334155;"><strong style="font-family: inherit;">Classe :</strong> <span style="background-color: ${theme.hex}15; color: ${theme.hex}; padding: 3px 8px; border-radius: 6px; font-weight: 700; font-size: 11px; font-family: inherit;">${finalGrade}</span></div>
+            <div style="font-size: 10px; color: #94a3b8; font-style: italic; margin-top: 2px; font-family: inherit;">Fiche générée le ${new Date().toLocaleDateString('fr-FR')}</div>
+          </div>
         </div>
       `;
       printContainer.appendChild(header);
@@ -340,9 +1445,37 @@ const ChatMessage = memo(({ message, index, onCopy, copiedId, theme, onSettingsC
       // Clone the message content
       const contentClone = element.cloneNode(true) as HTMLElement;
       
-      // Remove the copy/download buttons from the clone
+      // Remove copy/download buttons and other interactive UI widgets from the printed element
       const buttons = contentClone.querySelector('.flex.items-center.gap-1.mt-2');
       if (buttons) buttons.remove();
+      
+      contentClone.querySelectorAll('button').forEach((b: any) => b.remove());
+      contentClone.querySelectorAll('.zoom-controls, .copy-button, .transform-controls, .zoom-slider-container, .interactive-controls').forEach((el: any) => el.remove());
+
+      // Manually prefix lists with colored numbers and bullet symbols to guarantee consistent rendering in html2canvas
+      const listItems = contentClone.querySelectorAll('li');
+      listItems.forEach((li) => {
+        const parent = li.parentElement;
+        if (!parent) return;
+        
+        if (parent.tagName.toLowerCase() === 'ol') {
+          const siblings = Array.from(parent.children);
+          const index = siblings.indexOf(li) + 1;
+          const prefix = document.createElement('span');
+          prefix.style.fontWeight = '700';
+          prefix.style.marginRight = '8px';
+          prefix.style.color = theme.hex;
+          prefix.textContent = `${index}. `;
+          li.prepend(prefix);
+        } else if (parent.tagName.toLowerCase() === 'ul') {
+          const prefix = document.createElement('span');
+          prefix.style.marginRight = '8px';
+          prefix.style.color = theme.hex;
+          prefix.style.fontWeight = '900';
+          prefix.textContent = '• ';
+          li.prepend(prefix);
+        }
+      });
       
       // Ensure the clone is fully visible and not affected by motion animations
       contentClone.style.opacity = '1';
@@ -640,21 +1773,88 @@ const ChatMessage = memo(({ message, index, onCopy, copiedId, theme, onSettingsC
       await pdf.html(printContainer, {
         callback: (doc) => {
           const totalPages = (doc as any).internal.getNumberOfPages();
+          
           for (let i = 1; i <= totalPages; i++) {
             doc.setPage(i);
+
+            // En-tête de page courante (running header) de qualité pour les pages consécutives
+            if (i > 1) {
+              try {
+                doc.setFont('Helvetica', 'Bold');
+                doc.setFontSize(8);
+                doc.setTextColor(100, 116, 139); // slate-500
+                doc.text("Monsieur FABRICEL - Assistant Pédagogique d'Excellence", 30, 25);
+                
+                doc.setFont('Helvetica', 'Normal');
+                doc.setFontSize(7);
+                doc.setTextColor(148, 163, 184); // slate-400
+                doc.text(finalDocType, pdfWidth - 30, 25, { align: 'right' });
+
+                doc.setDrawColor(226, 232, 240); // slate-200 border
+                doc.setLineWidth(1);
+                doc.line(30, 31, pdfWidth - 30, 31);
+              } catch (err) {
+                console.warn("Could not render top running header:", err);
+              }
+            }
+
+            // Watermark (Filigrane) transparent en diagonale (si activé)
+            if (pdfEnableWatermark) {
+              try {
+                doc.setFont('Helvetica', 'Bold');
+                doc.setFontSize(38);
+                // Set text color to a soft, almost invisible gray for printers
+                doc.setTextColor(244, 244, 244);
+                // Draw diagonal text centered on A4 page
+                doc.text("Monsieur FABRICEL", pdfWidth / 2, pdfHeight / 2, { align: 'center', angle: -32 });
+              } catch (err) {
+                console.warn("Could not render rotated watermark:", err);
+              }
+            }
+
+            // Bas de page (Footer) - Ligne séparatrice
+            doc.setDrawColor(226, 232, 240); // slate-200 border
+            doc.setLineWidth(1);
+            doc.line(30, pdfHeight - 45, pdfWidth - 30, pdfHeight - 45);
+
+            // Infos admin à gauche (Contacts & Profil de Monsieur FABRICEL)
+            doc.setFont('Helvetica', 'Bold');
+            doc.setFontSize(7.5);
+            doc.setTextColor(100, 116, 139); // slate-500
+            doc.text("Monsieur FABRICEL - Assistant Pédagogique Intelligent", 30, pdfHeight - 33);
+            doc.setFont('Helvetica', 'Normal');
+            doc.setFontSize(7);
+            doc.text("Contact Rapide : +261 38 07 709 73  |  fabricel534@gmail.com  |  Toamasina, Madagascar", 30, pdfHeight - 22);
+
+            // Numéro de page à droite
+            doc.setFont('Helvetica', 'Bold');
             doc.setFontSize(8);
-            doc.setTextColor(150);
-            doc.text(`Page ${i} sur ${totalPages} - Monsieur FABRICEL`, pdfWidth / 2, pdfHeight - 15, { align: 'center' });
+            doc.setTextColor(71, 85, 105); // slate-600
+            doc.text(`Page ${i} de ${totalPages}`, pdfWidth - 30, pdfHeight - 33, { align: 'right' });
+            doc.setFont('Helvetica', 'Normal');
+            doc.setFontSize(7);
+            doc.setTextColor(148, 163, 184); // slate-400
+            doc.text(finalDocType, pdfWidth - 30, pdfHeight - 22, { align: 'right' });
           }
           
-          doc.save(`document-fabricel-${Date.now()}.pdf`);
+          const safeSubjectLabel = finalSubject.toLowerCase()
+            .normalize("NFD").replace(/[\u0300-\u036f]/g, "") // remove accents
+            .replace(/[^a-z0-9]/gi, '_');
+          
+          const safeTypeLabel = finalDocType.toLowerCase()
+            .normalize("NFD").replace(/[\u0300-\u036f]/g, "") // remove accents
+            .replace(/[^a-z0-9]/gi, '_');
+
+          doc.save(`document-fabricel-${safeTypeLabel}-${safeSubjectLabel}-${Date.now().toString().slice(-6)}.pdf`);
           document.body.removeChild(printContainer);
           setIsGeneratingPDF(false);
+          setIsConfigModalOpen(false);
         },
-        x: 20,
-        y: 20,
-        width: pdfWidth - 40, 
-        windowWidth: 700,
+        x: 0,
+        y: 0,
+        margin: [45, 30, 50, 30],
+        width: pdfWidth - 60, 
+        windowWidth: 800,
         autoPaging: 'text',
         html2canvas: {
           scale: 2,
@@ -663,7 +1863,72 @@ const ChatMessage = memo(({ message, index, onCopy, copiedId, theme, onSettingsC
           backgroundColor: '#ffffff',
           imageTimeout: 15000,
           logging: false,
+          width: 800,
+          windowWidth: 800,
+          scrollX: 0,
+          scrollY: 0,
           onclone: (clonedDoc) => {
+            // Remove duplicate MathML tags (stops superposition of symbols)
+            clonedDoc.querySelectorAll('.katex-mathml').forEach((el: any) => el.remove());
+
+            // Inject absolute CDN URLs for KaTeX fonts to ensure standard math symbols like minus, less-than-or-equal, etc.
+            // render beautifully inside html2canvas's sandboxed environment without failing due to CORS/relative paths
+            try {
+              const katexFontsStyle = clonedDoc.createElement('style');
+              katexFontsStyle.textContent = `
+                @font-face {
+                  font-family: 'KaTeX_Main';
+                  src: url('https://cdn.jsdelivr.net/npm/katex@0.16.45/dist/fonts/KaTeX_Main-Regular.woff2') format('woff2');
+                  font-weight: normal;
+                  font-style: normal;
+                }
+                @font-face {
+                  font-family: 'KaTeX_Main';
+                  src: url('https://cdn.jsdelivr.net/npm/katex@0.16.45/dist/fonts/KaTeX_Main-Bold.woff2') format('woff2');
+                  font-weight: bold;
+                  font-style: normal;
+                }
+                @font-face {
+                  font-family: 'KaTeX_Math';
+                  src: url('https://cdn.jsdelivr.net/npm/katex@0.16.45/dist/fonts/KaTeX_Math-Italic.woff2') format('woff2');
+                  font-weight: normal;
+                  font-style: italic;
+                }
+                @font-face {
+                  font-family: 'KaTeX_Math';
+                  src: url('https://cdn.jsdelivr.net/npm/katex@0.16.45/dist/fonts/KaTeX_Math-BoldItalic.woff2') format('woff2');
+                  font-weight: bold;
+                  font-style: italic;
+                }
+                @font-face {
+                  font-family: 'KaTeX_Size1';
+                  src: url('https://cdn.jsdelivr.net/npm/katex@0.16.45/dist/fonts/KaTeX_Size1-Regular.woff2') format('woff2');
+                }
+                @font-face {
+                  font-family: 'KaTeX_Size2';
+                  src: url('https://cdn.jsdelivr.net/npm/katex@0.16.45/dist/fonts/KaTeX_Size2-Regular.woff2') format('woff2');
+                }
+                @font-face {
+                  font-family: 'KaTeX_Size3';
+                  src: url('https://cdn.jsdelivr.net/npm/katex@0.16.45/dist/fonts/KaTeX_Size3-Regular.woff2') format('woff2');
+                }
+                @font-face {
+                  font-family: 'KaTeX_Size4';
+                  src: url('https://cdn.jsdelivr.net/npm/katex@0.16.45/dist/fonts/KaTeX_Size4-Regular.woff2') format('woff2');
+                }
+                
+                /* Override any fallback overrides to force native KaTeX fonts for formula glyphs */
+                .katex, .katex * {
+                  font-family: KaTeX_Main, KaTeX_Math, KaTeX_Size1, KaTeX_Size2, KaTeX_Size3, KaTeX_Size4, serif !important;
+                  letter-spacing: normal !important;
+                  word-spacing: normal !important;
+                }
+              `;
+              clonedDoc.head.appendChild(katexFontsStyle);
+            } catch (e) {
+              console.warn("Could not inject KaTeX CDN fonts into cloned document:", e);
+            }
+
             // Helper to strip all CSS at-rules with matching braces (handles nesting)
             const stripAllAtBlocks = (text: string) => {
               // Only strip at-rules that are known to be problematic or unnecessary for PDF
@@ -748,13 +2013,13 @@ const ChatMessage = memo(({ message, index, onCopy, copiedId, theme, onSettingsC
             const modernColorFuncs = ['oklch', 'oklab', 'lab', 'lch', 'hwb', 'color-mix', 'color-contrast', 'light-dark', 'color', 'image-set', 'conic-gradient', 'repeating-conic-gradient', 'clamp'];
 
             // 0. Clean up the document structure
-            const scripts = Array.from(clonedDoc.getElementsByTagName('script'));
+            const scripts = Array.from(clonedDoc.getElementsByTagName('script')) as any[];
             scripts.forEach(s => s.remove());
             
-            const iframes = Array.from(clonedDoc.getElementsByTagName('iframe'));
+            const iframes = Array.from(clonedDoc.getElementsByTagName('iframe')) as any[];
             iframes.forEach(f => f.remove());
 
-            const metas = Array.from(clonedDoc.getElementsByTagName('meta'));
+            const metas = Array.from(clonedDoc.getElementsByTagName('meta')) as any[];
             metas.forEach(m => m.remove());
 
             // 0.1 We keep external stylesheets but will try to override problematic variables
@@ -762,7 +2027,7 @@ const ChatMessage = memo(({ message, index, onCopy, copiedId, theme, onSettingsC
             // We specifically want to ensure KaTeX styles are preserved
             
             // 1. Aggressive removal of modern CSS from all style tags in head and body
-            const styleTags = Array.from(clonedDoc.getElementsByTagName('style'));
+            const styleTags = Array.from(clonedDoc.getElementsByTagName('style')) as any[];
             styleTags.forEach(tag => {
               try {
                 let content = tag.textContent || tag.innerHTML;
@@ -802,8 +2067,8 @@ const ChatMessage = memo(({ message, index, onCopy, copiedId, theme, onSettingsC
             
             clonedDoc.documentElement.style.backgroundColor = '#ffffff';
             clonedDoc.documentElement.style.fontSize = '16px';
-            clonedDoc.documentElement.style.width = '1024px';
-            clonedDoc.documentElement.style.maxWidth = '1024px';
+            clonedDoc.documentElement.style.width = '800px';
+            clonedDoc.documentElement.style.maxWidth = '800px';
             clonedDoc.documentElement.style.transform = 'none';
             clonedDoc.documentElement.style.transformOrigin = 'top left';
             clonedDoc.body.style.backgroundColor = '#ffffff';
@@ -979,7 +2244,7 @@ const ChatMessage = memo(({ message, index, onCopy, copiedId, theme, onSettingsC
             // 3. Final safety pass for modern CSS and px units in attributes
             try {
               // Clean head style tags again if needed, but avoid innerHTML on body
-              const finalStyles = Array.from(clonedDoc.getElementsByTagName('style'));
+              const finalStyles = Array.from(clonedDoc.getElementsByTagName('style')) as any[];
               finalStyles.forEach(tag => {
                 let content = tag.textContent || '';
                 if (content.match(/oklch|oklab|lab|lch|hwb|color-mix|color-contrast|light-dark|color/i)) {
@@ -999,9 +2264,9 @@ const ChatMessage = memo(({ message, index, onCopy, copiedId, theme, onSettingsC
               container.style.position = 'relative';
               container.style.left = '0';
               container.style.top = '0';
-              container.style.width = '1024px';
-              container.style.minWidth = '1024px';
-              container.style.maxWidth = '1024px';
+              container.style.width = '800px';
+              container.style.minWidth = '800px';
+              container.style.maxWidth = '800px';
               container.style.padding = '40px';
               container.style.color = 'black';
               container.style.backgroundColor = 'white';
@@ -1016,7 +2281,7 @@ const ChatMessage = memo(({ message, index, onCopy, copiedId, theme, onSettingsC
             }
 
             // 5. Final cleanup of empty styles
-            const finalStyles = Array.from(clonedDoc.getElementsByTagName('style'));
+            const finalStyles = Array.from(clonedDoc.getElementsByTagName('style')) as any[];
             finalStyles.forEach(tag => {
               if (!tag.textContent?.trim()) {
                 tag.remove();
@@ -1059,7 +2324,8 @@ const ChatMessage = memo(({ message, index, onCopy, copiedId, theme, onSettingsC
         )}
       </Avatar>
       <div className={cn(
-        "flex flex-col max-w-[85%] group",
+        "flex flex-col group transition-all duration-300",
+        isWideLayout ? "max-w-[95%] w-full" : "max-w-[85%]",
         !isModel ? "items-end" : "items-start"
       )}>
         <div 
@@ -1078,13 +2344,30 @@ const ChatMessage = memo(({ message, index, onCopy, copiedId, theme, onSettingsC
           )} style={{ "--theme-color": isModel ? theme.hex : 'inherit' } as any}>
             <ReactMarkdown 
               remarkPlugins={[remarkGfm, remarkMath]}
-              rehypePlugins={[rehypeKatex]}
+              rehypePlugins={[[rehypeKatex, { macros: KATEX_MACROS }]]}
               components={{
-                h1: ({ children }) => <h1 className={cn("font-bold text-xl mb-4", isModel ? theme.text : "")} style={isModel ? theme.textStyle : {}}>{children}</h1>,
-                h2: ({ children }) => <h2 className={cn("font-bold text-lg mb-3", isModel ? theme.text : "")} style={isModel ? theme.textStyle : {}}>{children}</h2>,
-                h3: ({ children }) => <h3 className={cn("font-bold text-md mb-2", isModel ? theme.text : "")} style={isModel ? theme.textStyle : {}}>{children}</h3>,
-                h4: ({ children }) => <h4 className={cn("font-bold text-sm mb-1", isModel ? theme.text : "")} style={isModel ? theme.textStyle : {}}>{children}</h4>,
-                strong: ({ children }) => <strong className={cn("font-bold", isModel ? theme.text : "")} style={isModel ? theme.textStyle : {}}>{children}</strong>,
+                h1: ({ children }) => <h1 className={cn("font-bold text-xl mb-4", isModel ? theme.text : "")} style={isModel ? theme.textStyle : {}}>{replaceHtmlBreaks(children)}</h1>,
+                h2: ({ children }) => <h2 className={cn("font-bold text-lg mb-3", isModel ? theme.text : "")} style={isModel ? theme.textStyle : {}}>{replaceHtmlBreaks(children)}</h2>,
+                h3: ({ children }) => <h3 className={cn("font-bold text-md mb-2", isModel ? theme.text : "")} style={isModel ? theme.textStyle : {}}>{replaceHtmlBreaks(children)}</h3>,
+                h4: ({ children }) => <h4 className={cn("font-bold text-sm mb-1", isModel ? theme.text : "")} style={isModel ? theme.textStyle : {}}>{replaceHtmlBreaks(children)}</h4>,
+                strong: ({ children }) => <strong className={cn("font-bold", isModel ? theme.text : "")} style={isModel ? theme.textStyle : {}}>{replaceHtmlBreaks(children)}</strong>,
+                p: ({ children, ...props }: any) => <p className="mb-4" {...props}>{replaceHtmlBreaks(children)}</p>,
+                li: ({ children, ...props }: any) => <li className="mb-1" {...props}>{replaceHtmlBreaks(children)}</li>,
+                td: ({ children, ...props }: any) => <td {...props}>{replaceHtmlBreaks(children)}</td>,
+                th: ({ children, ...props }: any) => <th {...props}>{replaceHtmlBreaks(children)}</th>,
+                pre: ({ children, ...props }: any) => {
+                  const isSpecial = React.Children.toArray(children).some((child: any) => {
+                    if (child && typeof child === 'object' && child.props) {
+                      const className = child.props.className || "";
+                      return className.includes("language-svg") || className.includes("language-mermaid");
+                    }
+                    return false;
+                  });
+                  if (isSpecial) {
+                    return <div className="not-prose my-4">{children}</div>;
+                  }
+                  return <pre {...props}>{children}</pre>;
+                },
                 a: ({ node, children, href, ...props }: any) => {
                   if (href === "#settings") {
                     return (
@@ -1110,8 +2393,12 @@ const ChatMessage = memo(({ message, index, onCopy, copiedId, theme, onSettingsC
                     return <Mermaid chart={String(children).replace(/\n$/, "")} />;
                   }
                   
-                  if (!inline && language === "svg") {
-                    return <ZoomableSVG svgCode={String(children)} />;
+                  const childrenStr = String(children);
+                  const trimmedStr = childrenStr.trim();
+                  const isSvgContent = trimmedStr.startsWith("<svg") || (trimmedStr.includes("<svg") && trimmedStr.includes("</svg>")) || trimmedStr.includes("<marker") || trimmedStr.includes("<circle") || trimmedStr.includes("<line") || trimmedStr.includes("<rect") || trimmedStr.includes("<polygon") || trimmedStr.includes("<path");
+                  if (!inline && (language === "svg" || (isSvgContent && (language === "xml" || language === "html" || !language)))) {
+                    const svgCode = normalizeSvgContent(childrenStr);
+                    return <ZoomableSVG svgCode={svgCode} />;
                   }
                   
                   return (
@@ -1133,7 +2420,7 @@ const ChatMessage = memo(({ message, index, onCopy, copiedId, theme, onSettingsC
               !isModel ? "justify-end" : "justify-start"
             )}>
               {message.attachments.map((att, i) => (
-                <div key={i} className="max-w-[200px] rounded-xl overflow-hidden border border-slate-200/50 bg-white/10 backdrop-blur-sm">
+                <div key={`att-${index}-${i}-${att.mimeType}-${att.data.length}`} className="max-w-[200px] rounded-xl overflow-hidden border border-slate-200/50 bg-white/10 backdrop-blur-sm">
                   {att.mimeType.startsWith('image/') ? (
                     <div className="relative group/img">
                       <img 
@@ -1218,7 +2505,11 @@ const ChatMessage = memo(({ message, index, onCopy, copiedId, theme, onSettingsC
                 size="sm"
                 variant="ghost"
                 className="h-7 gap-1.5 text-[10px] font-medium text-slate-500 hover:text-emerald-600"
-                onClick={downloadAsPDF}
+                onClick={() => {
+                  setDownloadedPdfInfo(null);
+                  setDownloadedDocxInfo(null);
+                  setIsConfigModalOpen(true);
+                }}
                 disabled={isGeneratingPDF}
               >
                 {isGeneratingPDF ? (
@@ -1226,7 +2517,24 @@ const ChatMessage = memo(({ message, index, onCopy, copiedId, theme, onSettingsC
                 ) : (
                   <FileText className="w-3 h-3" />
                 )}
-                {isGeneratingPDF ? "Génération..." : "Télécharger PDF"}
+                {isGeneratingPDF ? "Génération..." : "Télécharger / Exporter"}
+              </Button>
+              <Button
+                size="sm"
+                variant="ghost"
+                className="h-7 gap-1.5 text-[10px] font-semibold text-amber-800 hover:text-amber-900 bg-amber-50/70 hover:bg-amber-100 border border-amber-200/80 rounded-lg shadow-2xs transition"
+                onClick={() => setIsDriveModalOpen(true)}
+                title="Exporter cette fiche directement vers Google Drive"
+              >
+                <svg className="w-3.5 h-3.5 shrink-0" viewBox="0 0 87.3 78" xmlns="http://www.w3.org/2000/svg">
+                  <path d="m6.6 66.85 3.85 6.65c.8 1.4 1.95 2.5 3.3 3.3l13.75-23.8h-27.5c0 1.55.4 3.1 1.2 4.5z" fill="#0066da"/>
+                  <path d="m43.65 25-13.75-23.8c-1.35.8-2.5 1.9-3.3 3.3l-25.4 44c-.8 1.4-1.2 2.95-1.2 4.5h27.5z" fill="#00ac47"/>
+                  <path d="m73.55 76.8c1.35-.8 2.5-1.9 3.3-3.3l1.6-2.75 7.65-13.25c.8-1.4 1.2-2.95 1.2-4.5h-27.502l5.852 11.5z" fill="#ea4335"/>
+                  <path d="m43.65 25 13.75-23.8c-1.35-.8-2.9-1.2-4.5-1.2h-18.5c-1.6 0-3.15.45-4.5 1.2z" fill="#00832d"/>
+                  <path d="m59.8 53h-32.3l-13.75 23.8c1.35.8 2.9 1.2 4.5 1.2h50.8c1.6 0 3.15-.45 4.5-1.2z" fill="#2684fc"/>
+                  <path d="m73.4 26.5-12.7-22c-.8-1.4-1.95-2.5-3.3-3.3l-13.75 23.8 16.15 28h27.45c0-1.55-.4-3.1-1.2-4.5z" fill="#ffba00"/>
+                </svg>
+                <span>Google Drive</span>
               </Button>
             </div>
           )}
@@ -1235,6 +2543,569 @@ const ChatMessage = memo(({ message, index, onCopy, copiedId, theme, onSettingsC
           {isModel ? "Monsieur FABRICEL" : "Vous"}
         </span>
       </div>
+
+      {/* Configurer la mise en page du PDF */}
+      <AnimatePresence>
+        {isConfigModalOpen && (
+          <div key={`pdf-config-modal-backdrop-${index}`} className="fixed inset-0 z-50 flex items-center justify-center p-3 sm:p-4 bg-slate-900/60 backdrop-blur-md">
+            <motion.div
+              initial={{ scale: 0.95, opacity: 0, y: 15 }}
+              animate={{ scale: 1, opacity: 1, y: 0 }}
+              exit={{ scale: 0.95, opacity: 0, y: 15 }}
+              transition={{ duration: 0.2, ease: "easeOut" }}
+              className="bg-white rounded-2xl shadow-2xl max-w-4xl w-full max-h-[90vh] flex flex-col overflow-hidden border border-slate-100 text-slate-800"
+            >
+              {/* Header */}
+              <div className="flex items-center justify-between px-5 py-3.5 sm:px-6 sm:py-4 border-b border-slate-150 bg-slate-50 shrink-0">
+                <div className="flex items-center gap-2.5">
+                  <div className="p-2 rounded-lg text-white" style={{ backgroundColor: theme.hex }}>
+                    <FileText className="w-5 h-5" />
+                  </div>
+                  <div>
+                    <h3 className="font-bold text-sm sm:text-base text-slate-900">Mise en page PDF Professionnelle</h3>
+                    <p className="text-[10px] sm:text-[11px] text-slate-500">Configurez l'entête et le pied de page de votre fiche d'enseignement</p>
+                  </div>
+                </div>
+                <button
+                  onClick={() => setIsConfigModalOpen(false)}
+                  className="rounded-full p-1.5 text-slate-400 hover:text-slate-600 hover:bg-slate-100 transition-colors"
+                >
+                  <X className="w-4 h-4" />
+                </button>
+              </div>
+
+              {/* Grid Content - Flexible and Scrollable */}
+              <div className="flex-1 min-h-0 overflow-y-auto">
+                <div className="p-5 sm:p-6 grid grid-cols-1 md:grid-cols-12 gap-6">
+                  
+                  {/* Left Column: Form Parameters */}
+                  <div className="md:col-span-6 space-y-4 text-left">
+                    <div className="pb-1 border-b border-slate-100">
+                      <span className="text-xs font-bold text-slate-400 uppercase tracking-wider">Paramètres du Document</span>
+                    </div>
+
+                    {/* 1. Type de document */}
+                    <div className="space-y-1.5">
+                      <label className="text-xs font-semibold text-slate-700 flex items-center justify-between">
+                        <span>Type de document (Entête gauche)</span>
+                        <span className="text-[10px] text-slate-400 font-normal">Ex: Fiche de cours...</span>
+                      </label>
+                      <select
+                        value={pdfDocType}
+                        onChange={(e) => setPdfDocType(e.target.value)}
+                        className="w-full px-3 py-1.5 sm:py-2 bg-slate-50 border border-slate-200 rounded-lg text-xs sm:text-sm focus:outline-none focus:ring-2 focus:ring-offset-1 focus:ring-emerald-500 text-slate-700 transition"
+                      >
+                        <option value="Fiche de préparation (Nouveau Programme d'Études)">Fiche de préparation (Nouveau Programme d'Études - MEN)</option>
+                        <option value="Situation d'Apprentissage et d'Évaluation (SAE - APC)">Situation d'Apprentissage et d'Évaluation (SAE - APC)</option>
+                        <option value="Fiche de préparation de leçon">Fiche de préparation de leçon (Classique)</option>
+                        <option value="Fiche de cours / Résumé">Fiche de cours / Résumé</option>
+                        <option value="Série d'exercices">Série d'exercices / TD</option>
+                        <option value="Évaluation / Devoir de contrôle">Évaluation / Devoir de contrôle</option>
+                        <option value="Sujet de composition">Sujet de composition / Examen</option>
+                        <option value="Autre">Sauter / Saisir un titre personnalisé...</option>
+                      </select>
+                      
+                      {pdfDocType === "Autre" && (
+                        <motion.div
+                          initial={{ opacity: 0, height: 0 }}
+                          animate={{ opacity: 1, height: "auto" }}
+                          className="pt-1"
+                        >
+                          <input
+                            type="text"
+                            placeholder="Ex: Devoir de Maison N°1"
+                            value={customDocType}
+                            onChange={(e) => setCustomDocType(e.target.value)}
+                            className="w-full px-3 py-1.5 sm:py-2 border border-slate-200 rounded-lg text-xs sm:text-sm bg-slate-50 focus:outline-none focus:border-stone-400 placeholder-slate-400 text-slate-800 animate-fade-in"
+                          />
+                        </motion.div>
+                      )}
+                    </div>
+
+                    {/* 2. Matière */}
+                    <div className="space-y-1.5">
+                      <label className="text-xs font-semibold text-slate-700">Matière / Discipline</label>
+                      <select
+                        value={pdfSubject}
+                        onChange={(e) => setPdfSubject(e.target.value)}
+                        className="w-full px-3 py-1.5 sm:py-2 bg-slate-50 border border-slate-200 rounded-lg text-xs sm:text-sm focus:outline-none focus:ring-2 focus:ring-offset-1 focus:ring-emerald-500 text-slate-700 transition"
+                      >
+                        <option value="Mathématiques">Mathématiques</option>
+                        <option value="Sciences de la Vie et de la Terre (SVT)">Sciences de la Vie et de la Terre (SVT)</option>
+                        <option value="Physique-Chimie">Physique-Chimie</option>
+                        <option value="Français">Français</option>
+                        <option value="Malagasy">Malagasy</option>
+                        <option value="Anglais">Anglais</option>
+                        <option value="Histoire-Géographie">Histoire-Géographie</option>
+                        <option value="Philosophie">Philosophie</option>
+                        <option value="Autre">Discipline personnalisée...</option>
+                      </select>
+
+                      {pdfSubject === "Autre" && (
+                        <motion.div
+                          initial={{ opacity: 0, height: 0 }}
+                          animate={{ opacity: 1, height: "auto" }}
+                          className="pt-1"
+                        >
+                          <input
+                            type="text"
+                            placeholder="Ex: Sciences Économiques & Sociales"
+                            value={customSubject}
+                            onChange={(e) => setCustomSubject(e.target.value)}
+                            className="w-full px-3 py-1.5 sm:py-2 border border-slate-200 rounded-lg text-xs sm:text-sm bg-slate-50 focus:outline-none focus:border-stone-400 placeholder-slate-400 text-slate-800 animate-fade-in"
+                          />
+                        </motion.div>
+                      )}
+                    </div>
+
+                    {/* 3. Classe */}
+                    <div className="space-y-1.5">
+                      <label className="text-xs font-semibold text-slate-700">Niveau / Classe d'études</label>
+                      <select
+                        value={pdfGrade}
+                        onChange={(e) => setPdfGrade(e.target.value)}
+                        className="w-full px-3 py-1.5 sm:py-2 bg-slate-50 border border-slate-200 rounded-lg text-xs sm:text-sm focus:outline-none focus:ring-2 focus:ring-offset-1 focus:ring-emerald-500 text-slate-700 transition"
+                      >
+                        <option value="Classe de Terminale D">Terminale D</option>
+                        <option value="Classe de Terminale C">Terminale C</option>
+                        <option value="Classe de Terminale A">Terminale A / OSE</option>
+                        <option value="Classe de Première">Première (L / S / G)</option>
+                        <option value="Classe de Seconde">Seconde</option>
+                        <option value="Classe de Troisième">Troisième (3ème)</option>
+                        <option value="Classe de Quatrième">Quatrième (4ème)</option>
+                        <option value="Classe de Cinquième">Cinquième (5ème)</option>
+                        <option value="Classe de Sixième">Sixième (6ème)</option>
+                        <option value="Enseignement Primaire">Primaire (T1 à T5 / CEP)</option>
+                        <option value="Autre">Classe personnalisée...</option>
+                      </select>
+
+                      {pdfGrade === "Autre" && (
+                        <motion.div
+                          initial={{ opacity: 0, height: 0 }}
+                          animate={{ opacity: 1, height: "auto" }}
+                          className="pt-1"
+                        >
+                          <input
+                            type="text"
+                            placeholder="Ex: Enseignement Supérieur (Licence)"
+                            value={customGrade}
+                            onChange={(e) => setCustomGrade(e.target.value)}
+                            className="w-full px-3 py-1.5 sm:py-2 border border-slate-200 rounded-lg text-xs sm:text-sm bg-slate-50 focus:outline-none focus:border-stone-400 placeholder-slate-400 text-slate-800 animate-fade-in"
+                          />
+                        </motion.div>
+                      )}
+                    </div>
+
+                    {/* Visuel Options */}
+                    <div className="pt-2 border-t border-slate-100 space-y-2.5">
+                      <span className="text-xs font-semibold text-slate-500 block">Paramètres et Contenu de la Fiche</span>
+                      
+                      {/* Brand Header Toggle */}
+                      <label className="flex items-start gap-2.5 cursor-pointer select-none">
+                        <input
+                          type="checkbox"
+                          checked={pdfIncludeBrandHeader}
+                          onChange={(e) => setPdfIncludeBrandHeader(e.target.checked)}
+                          className="mt-0.5 w-4 h-4 rounded text-emerald-600 focus:ring-emerald-500 border-slate-300 transition"
+                        />
+                        <div className="text-xs">
+                          <span className="font-medium text-slate-800 block leading-tight">Présentation de "Monsieur FABRICEL"</span>
+                          <span className="text-slate-400 text-[10px]">Grand bandeau de présentation avec le logo et sous-titre pédagogique</span>
+                        </div>
+                      </label>
+
+                      {/* Strip convo filler toggle */}
+                      <label className="flex items-start gap-2.5 cursor-pointer select-none">
+                        <input
+                          type="checkbox"
+                          checked={pdfStripFiller}
+                          onChange={(e) => setPdfStripFiller(e.target.checked)}
+                          className="mt-0.5 w-4 h-4 rounded text-emerald-600 focus:ring-emerald-500 border-slate-300 transition"
+                        />
+                        <div className="text-xs">
+                          <span className="font-bold text-slate-850 block leading-tight flex items-center gap-1">
+                            Contenu de la fiche uniquement 
+                            <span className="bg-emerald-100 text-emerald-700 text-[7px] font-extrabold px-1.5 py-0.2 rounded">SANS CONSEILS DE FIN</span>
+                          </span>
+                          <span className="text-emerald-600 text-[10px] font-medium font-semibold">
+                            Masque automatiquement les salutations d'intro et les conseils/remarques d'assistant tout à la fin
+                          </span>
+                        </div>
+                      </label>
+
+                      {/* Brand Footer Toggle */}
+                      <label className="flex items-start gap-2.5 cursor-pointer select-none">
+                        <input
+                          type="checkbox"
+                          checked={pdfIncludeBrandFooter}
+                          onChange={(e) => setPdfIncludeBrandFooter(e.target.checked)}
+                          className="mt-0.5 w-4 h-4 rounded text-emerald-600 focus:ring-emerald-500 border-slate-300 transition"
+                        />
+                        <div className="text-xs">
+                          <span className="font-medium text-slate-800 block leading-tight">Coordonnées de contact (Pied de page)</span>
+                          <span className="text-slate-400 text-[10px]">Affiche vos contacts rapides (téléphone, e-mail) à chaque bas de page</span>
+                        </div>
+                      </label>
+
+                      {/* Watermark toggle */}
+                      {pdfIncludeBrandHeader && (
+                        <label className="flex items-start gap-2.5 cursor-pointer select-none">
+                          <input
+                            type="checkbox"
+                            checked={pdfEnableWatermark}
+                            onChange={(e) => setPdfEnableWatermark(e.target.checked)}
+                            className="mt-0.5 w-4 h-4 rounded text-emerald-600 focus:ring-emerald-500 border-slate-300 transition"
+                          />
+                          <div className="text-xs">
+                            <span className="font-medium text-slate-800 block leading-tight">Filigrane diagonal</span>
+                            <span className="text-slate-400 text-[10px]">Arrière-plan de sécurité discret sur chaque page</span>
+                          </div>
+                        </label>
+                      )}
+
+                      {/* Profile/avatar toggle */}
+                      {pdfIncludeBrandHeader && (
+                        <label className="flex items-start gap-2.5 cursor-pointer select-none">
+                          <input
+                            type="checkbox"
+                            checked={pdfIncludeAvatar}
+                            onChange={(e) => setPdfIncludeAvatar(e.target.checked)}
+                            className="mt-0.5 w-4 h-4 rounded text-emerald-600 focus:ring-emerald-500 border-slate-300 transition"
+                          />
+                          <div className="text-xs">
+                            <span className="font-medium text-slate-800 block leading-tight">Photo de profil de l'assistant</span>
+                            <span className="text-slate-400 text-[10px]">Affiche le portrait à gauche dans l'en-tête</span>
+                          </div>
+                        </label>
+                      )}
+                    </div>
+
+                    {/* Mode d'Exportation */}
+                    <div className="pt-2 border-t border-slate-100 space-y-2">
+                      <span className="text-xs font-semibold text-slate-500 block">Mode de Téléchargement / Exportation</span>
+                      <div className="grid grid-cols-1 gap-2">
+                        {/* Option 1: Direct Print */}
+                        <label className={cn(
+                          "flex items-start gap-2.5 p-2.5 rounded-lg border cursor-pointer transition select-none text-left",
+                          exportType === "print" ? "bg-emerald-50/50 border-emerald-500 animate-pulse-subtle" : "bg-slate-50 border-slate-200"
+                        )}>
+                          <input
+                            type="radio"
+                            name="exportType"
+                            checked={exportType === "print"}
+                            onChange={() => setExportType("print")}
+                            className="mt-0.5 text-emerald-600 focus:ring-emerald-500 shrink-0"
+                          />
+                          <div className="text-[11px] leading-snug">
+                            <span className="font-bold text-slate-800 block flex items-center gap-1.5">
+                              Impression Directe & Sauvegarder PDF
+                              <span className="bg-emerald-100 text-emerald-700 text-[8px] font-extrabold px-1.5 py-0.5 rounded-full">RECOMMANDÉ</span>
+                            </span>
+                            <span className="text-slate-500 text-[10px] block mt-0.5">
+                              Recopie 100% conforme des formules et schémas sans bug. Idéal sur téléphones, tablettes ou application de messagerie (WhatsApp, Facebook).
+                            </span>
+                          </div>
+                        </label>
+
+                        {/* Option 2: Download raw PDF file */}
+                        <label className={cn(
+                          "flex items-start gap-2.5 p-2.5 rounded-lg border cursor-pointer transition select-none text-left",
+                          exportType === "pdf" ? "bg-emerald-50/50 border-emerald-500" : "bg-slate-50 border-slate-200"
+                        )}>
+                          <input
+                            type="radio"
+                            name="exportType"
+                            checked={exportType === "pdf"}
+                            onChange={() => setExportType("pdf")}
+                            className="mt-0.5 text-emerald-600 focus:ring-emerald-500 shrink-0"
+                          />
+                          <div className="text-[11px] leading-snug">
+                            <span className="font-bold text-slate-800 block">Fichier PDF Interactif (.pdf)</span>
+                            <span className="text-slate-500 text-[10px] block mt-0.5">
+                              Modèle de compilation hors-ligne téléchargé directement. Moins compatible sur navigateurs mobiles.
+                            </span>
+                          </div>
+                        </label>
+
+                        {/* Option 3: Download editable Word file */}
+                        <label className={cn(
+                          "flex items-start gap-2.5 p-2.5 rounded-lg border cursor-pointer transition select-none text-left",
+                          exportType === "docx" ? "bg-emerald-50/50 border-emerald-500" : "bg-slate-50 border-slate-200"
+                        )}>
+                          <input
+                            type="radio"
+                            name="exportType"
+                            checked={exportType === "docx"}
+                            onChange={() => setExportType("docx")}
+                            className="mt-0.5 text-emerald-600 focus:ring-emerald-500 shrink-0"
+                          />
+                          <div className="text-[11px] leading-snug">
+                            <span className="font-bold text-slate-800 block flex items-center gap-1.5">
+                              Fichier Word Éditable (.doc)
+                              <span className="bg-emerald-100 text-emerald-700 text-[8px] font-extrabold px-1.5 py-0.5 rounded-full">PRO</span>
+                            </span>
+                            <span className="text-slate-500 text-[10px] block mt-0.5">
+                              Générez un vrai document entièrement modifiable. Idéal pour personnaliser l'exercice ou modifier le texte directement dans Word ou Google Docs.
+                            </span>
+                          </div>
+                        </label>
+
+                        {/* Option 4: Download ready-to-compile LaTeX source code */}
+                        <label className={cn(
+                          "flex items-start gap-2.5 p-2.5 rounded-lg border cursor-pointer transition select-none text-left",
+                          exportType === "tex" ? "bg-emerald-50/50 border-emerald-500" : "bg-slate-50 border-slate-200"
+                        )}>
+                          <input
+                            type="radio"
+                            name="exportType"
+                            checked={exportType === "tex"}
+                            onChange={() => setExportType("tex")}
+                            className="mt-0.5 text-emerald-600 focus:ring-emerald-500 shrink-0"
+                          />
+                          <div className="text-[11px] leading-snug">
+                            <span className="font-bold text-slate-800 block flex items-center gap-1.5">
+                              Code Source LaTeX (.tex)
+                              <span className="bg-teal-100 text-teal-800 text-[8px] font-extrabold px-1.5 py-0.5 rounded-full">LATEX PUR</span>
+                            </span>
+                            <span className="text-slate-500 text-[10px] block mt-0.5">
+                              Document source .tex pré-configuré (amsmath, babel, geometry). Prêt à être compilé dans Overleaf, TeXStudio ou VSCode.
+                            </span>
+                          </div>
+                        </label>
+
+                        {/* Option 5: Export directly to Google Drive */}
+                        <label className={cn(
+                          "flex items-start gap-2.5 p-2.5 rounded-lg border cursor-pointer transition select-none text-left",
+                          exportType === "drive" ? "bg-amber-50/70 border-amber-500 ring-2 ring-amber-500/20" : "bg-slate-50 border-slate-200"
+                        )}>
+                          <input
+                            type="radio"
+                            name="exportType"
+                            checked={exportType === "drive"}
+                            onChange={() => setExportType("drive")}
+                            className="mt-0.5 text-amber-600 focus:ring-amber-500 shrink-0"
+                          />
+                          <div className="text-[11px] leading-snug">
+                            <span className="font-bold text-slate-800 block flex items-center gap-1.5">
+                              Google Drive (Cloud Enseignant)
+                              <span className="bg-amber-100 text-amber-800 text-[8px] font-extrabold px-1.5 py-0.5 rounded-full">GOOGLE DRIVE</span>
+                            </span>
+                            <span className="text-slate-500 text-[10px] block mt-0.5">
+                              Sauvegardez directement dans votre Google Drive personnel (Google Docs modifiable, PDF ou Word) avec sélection de dossier via Google Picker.
+                            </span>
+                          </div>
+                        </label>
+                      </div>
+                    </div>
+                  </div>
+
+                  {/* Right Column: Live Document Preview */}
+                  <div className="md:col-span-6 bg-slate-50 p-4 rounded-xl border border-slate-200/60 flex flex-col justify-start">
+                    {downloadedPdfInfo || downloadedDocxInfo ? (
+                      <div className="flex-1 flex flex-col justify-between text-left p-2 h-full">
+                        <div className="space-y-4">
+                          <div className="flex items-center gap-3">
+                            <div className="w-12 h-12 rounded-full bg-emerald-100 flex items-center justify-center text-emerald-600 shrink-0">
+                              <Check className="w-6 h-6 stroke-[3px]" />
+                            </div>
+                            <div>
+                              <h4 className="font-extrabold text-sm text-slate-900 leading-snug">Document Prêt & Téléchargé !</h4>
+                              <p className="text-[10px] text-slate-500 font-medium">Votre fichier {downloadedDocxInfo ? "Word (.doc) éditable" : "PDF"} a été compilé avec succès.</p>
+                            </div>
+                          </div>
+
+                          <div className="bg-white rounded-xl border border-slate-200 p-4 space-y-3 shadow-sm">
+                            <div className="flex items-start gap-2.5">
+                              <FileIcon className="w-4 h-4 text-emerald-600 shrink-0 mt-0.5" />
+                              <div className="space-y-0.5">
+                                <span className="text-[10px] font-bold text-slate-400 block uppercase tracking-wider">Nom du Fichier</span>
+                                <span className="text-xs font-bold text-slate-800 break-all">
+                                  {downloadedDocxInfo ? downloadedDocxInfo.filename : downloadedPdfInfo?.filename}
+                                </span>
+                              </div>
+                            </div>
+                          </div>
+
+                          {/* Guide: Où trouver le fichier PDF ou Word */}
+                          <div className="bg-amber-50/70 rounded-xl border border-amber-100 p-4 space-y-2.5 text-xs text-slate-700 animate-fadeIn">
+                            <h5 className="font-bold text-slate-800 flex items-center gap-2 text-[11px]">
+                              💡 Où se trouve votre fichier enregistré ?
+                            </h5>
+                            <div className="space-y-1.5 text-[10px] sm:text-[10.5px] leading-relaxed text-slate-600">
+                              <p>
+                                📥 **Sur Ordinateur :** Le fichier a été envoyé vers votre dossier de téléchargements habituel (dossier **Téléchargements** ou **Downloads**).
+                              </p>
+                              {downloadedDocxInfo && (
+                                <p>
+                                  📝 **Modification libre :** Double-cliquez sur le fichier pour l'ouvrir dans **Microsoft Word** ou **LibreOffice**, ou déposez-le dans **Google Docs** pour modifier entièrement le texte, les questions ou les tableaux à votre guise !
+                                </p>
+                              )}
+                              <p>
+                                📱 **Sur Mobile / Tablette (Android & iPhone) :**
+                                Il s'enregistre dans la mémoire de votre appareil. Ouvrez l'application nommée <strong className="text-slate-800">"Fichiers"</strong>, <strong className="text-slate-800">"Mes Fichiers"</strong> ou <strong className="text-slate-800">"Files"</strong> de votre téléphone, puis accédez au dossier <strong className="text-slate-800">"Téléchargements"</strong> (Downloads).
+                              </p>
+                              <p>
+                                💬 **Note Réseaux & Iframe (WhatsApp / Facebook) :**
+                                Si vous êtes connecté depuis un navigateur de réseau social ou un iframe, les téléchargements automatiques peuvent être restreints. Utilisez les boutons ci-dessous pour forcer l'ouverture.
+                              </p>
+                            </div>
+                          </div>
+                        </div>
+
+                        {/* Special Mobile-Focused Helper Links */}
+                        <div className="pt-4 space-y-2 border-t border-slate-200 mt-4">
+                          <a
+                            href={downloadedDocxInfo ? downloadedDocxInfo.docxUrl : downloadedPdfInfo?.pdfUrl}
+                            target="_blank"
+                            rel="noreferrer"
+                            className="w-full flex items-center justify-center gap-2 rounded-xl bg-slate-900 hover:bg-slate-800 p-3 text-xs font-bold text-white transition active:scale-[0.98] shadow-md cursor-pointer"
+                          >
+                            <ExternalLink className="w-4 h-4" />
+                            Ouvrir & Partager {downloadedDocxInfo ? "(Fichier Modifiable)" : "(Recommandé sur Mobile)"}
+                          </a>
+                          
+                          <a
+                            href={downloadedDocxInfo ? downloadedDocxInfo.docxUrl : downloadedPdfInfo?.pdfUrl}
+                            download={downloadedDocxInfo ? downloadedDocxInfo.filename : downloadedPdfInfo?.filename}
+                            className="w-full flex items-center justify-center gap-2 rounded-xl bg-white border border-slate-200 hover:bg-slate-50 p-3 text-xs font-bold text-slate-700 transition active:scale-[0.98] shadow-sm cursor-pointer"
+                          >
+                            <Download className="w-4 h-4 text-emerald-600" />
+                            Forcer le téléchargement direct
+                          </a>
+                        </div>
+                      </div>
+                    ) : (
+                      <>
+                        <div className="text-[10px] font-bold text-slate-400 uppercase tracking-wider mb-2.5 flex items-center justify-between">
+                          <span>Aperçu de l'Impression A4</span>
+                          <span className="text-[9px] font-semibold text-emerald-600 bg-emerald-50 px-2 py-0.5 rounded-full border border-emerald-100">Format Professionnel</span>
+                        </div>
+
+                        {/* Interactive mini PDF page */}
+                        <div className="bg-white shadow-lg border border-slate-150 rounded-lg p-4 relative aspect-[1/1.4] overflow-hidden select-none flex flex-col justify-between text-[8px] leading-tight text-slate-800 shrink-0">
+                          
+                          {/* Diagonal Watermark simulation */}
+                          {pdfEnableWatermark && (
+                            <div className="absolute inset-0 flex items-center justify-center pointer-events-none overflow-hidden select-none">
+                              <span className="text-[11px] sm:text-[13px] font-bold text-slate-100/70 uppercase tracking-widest rotate-[-32deg] whitespace-nowrap">
+                                Monsieur FABRICEL
+                              </span>
+                            </div>
+                          )}
+
+                          {/* Header block simulation */}
+                          <div className="border border-slate-200 rounded-md p-2 bg-slate-50 flex items-center justify-between gap-1 z-10" style={{ borderColor: theme.hex }}>
+                            <div className="flex items-center gap-1.5 min-w-0 flex-1">
+                              {pdfIncludeAvatar && (
+                                <div className="w-6 h-6 rounded-full border border-slate-300 overflow-hidden shrink-0">
+                                  <img src={BOT_PHOTO_URL} alt="Fabricel bot profile" className="w-full h-full object-cover" />
+                                </div>
+                              )}
+                              <div className="min-w-0 flex-1">
+                                <div className="font-extrabold text-[5px] tracking-wider text-slate-500 uppercase leading-none">MONSIEUR FABRICEL</div>
+                                <div className="font-bold text-[8px] text-slate-900 truncate leading-tight">
+                                  {pdfDocType === "Autre" ? (customDocType.trim() || "Fiche Pédagogique") : pdfDocType}
+                                </div>
+                              </div>
+                            </div>
+                            
+                            <div className="text-[5px] text-slate-500 text-right shrink-0 space-y-0.5 pl-2 border-l border-slate-200">
+                              <div>Matière : <span className="font-bold text-slate-800 line-clamp-1">{pdfSubject === "Autre" ? (customSubject.trim() || "Discipline") : pdfSubject}</span></div>
+                              <div>Classe : <span className="font-bold text-slate-800 line-clamp-1">{pdfGrade === "Autre" ? (customGrade.trim() || "Classe") : pdfGrade}</span></div>
+                            </div>
+                          </div>
+
+                          {/* Body sheet preview mockup */}
+                          <div className="flex-1 my-3 flex flex-col gap-1.5 justify-center z-10 px-1 opacity-70">
+                            <div className="h-1 w-11/12 bg-slate-200 rounded"></div>
+                            <div className="h-1 w-full bg-slate-150 rounded"></div>
+                            <div className="h-1 w-10/12 bg-slate-150 rounded"></div>
+                            <div className="h-1 w-full bg-slate-150 rounded"></div>
+                            <div className="h-1 w-8/12 bg-slate-200 rounded"></div>
+                          </div>
+
+                          {/* Footer block simulation */}
+                          <div className="border-t border-slate-200 pt-1.5 text-[4.5px] leading-normal text-slate-400 flex items-center justify-between z-10 bg-white">
+                            <div className="truncate pr-2 shrink min-w-0 max-w-[80%] font-medium">
+                              Concepteur: Monsieur FABRICEL — Adr: Toamasina, Madagascar — Tél: +261 38 07 709 73
+                            </div>
+                            <div className="text-right shrink-0 text-slate-500 font-bold">Page 1 de 1</div>
+                          </div>
+                        </div>
+                      </>
+                    )}
+                  </div>
+
+                </div>
+              </div>
+
+              {/* Actions Footer - Fixed perfectly to the bottom */}
+              <div className="flex items-center gap-2.5 justify-end px-5 py-3.5 sm:px-6 sm:py-4 bg-slate-50 border-t border-slate-100 shrink-0">
+                {downloadedPdfInfo ? (
+                  <>
+                    <a
+                      href={downloadedPdfInfo.pdfUrl}
+                      target="_blank"
+                      rel="noreferrer"
+                      className="inline-flex items-center justify-center rounded-lg border border-slate-200 bg-white px-4 h-9 text-xs font-bold text-slate-700 hover:bg-slate-50 hover:text-slate-800 transition active:scale-95"
+                    >
+                      <Eye className="w-3.5 h-3.5 mr-2" />
+                      Visualiser le PDF
+                    </a>
+                    <Button
+                      onClick={() => setIsConfigModalOpen(false)}
+                      className="h-9 px-4 text-xs font-bold text-white shadow-md active:scale-95 bg-emerald-600 hover:bg-emerald-700 transition"
+                    >
+                      Terminé
+                    </Button>
+                  </>
+                ) : (
+                  <>
+                    <Button
+                      variant="outline"
+                      onClick={() => setIsConfigModalOpen(false)}
+                      className="h-9 px-4 text-xs font-semibold text-slate-500 bg-white border-slate-200 hover:bg-slate-50 hover:text-slate-700 hover:border-slate-300 transition-colors"
+                    >
+                      Annuler
+                    </Button>
+                    <Button
+                      onClick={handleExportAction}
+                      disabled={isGeneratingPDF}
+                      className="h-9 px-4 text-xs font-bold text-white transition-all shadow-md active:scale-95 group hover:brightness-105"
+                      style={{ backgroundColor: theme.hex }}
+                    >
+                      {isGeneratingPDF ? (
+                        <>
+                          <Loader2 className="w-3.5 h-3.5 mr-2 animate-spin" />
+                          Génération en cours...
+                        </>
+                      ) : (
+                        <>
+                          <FileText className="w-3.5 h-3.5 mr-2 group-hover:translate-x-0.5 transition-transform" />
+                          {exportType === "print" ? "Confirmer & Imprimer / Sauvegarder" : (exportType === "drive" ? "Continuer vers Google Drive" : "Confirmer & Télécharger")}
+                        </>
+                      )}
+                    </Button>
+                  </>
+                )}
+              </div>
+
+            </motion.div>
+          </div>
+        )}
+      </AnimatePresence>
+
+      {/* Google Drive Export Modal with Google Picker */}
+      <GoogleDriveExportModal
+        isOpen={isDriveModalOpen}
+        onClose={() => setIsDriveModalOpen(false)}
+        messageText={message.text}
+        theme={theme}
+        defaultTitle={pdfDocType === "Autre" ? (customDocType.trim() || "Fiche_Pedagogique") : pdfDocType}
+        defaultSubject={pdfSubject === "Autre" ? (customSubject.trim() || "Mathématiques") : pdfSubject}
+        defaultGrade={pdfGrade === "Autre" ? (customGrade.trim() || "Enseignement Général") : pdfGrade}
+        defaultDocType={pdfDocType === "Autre" ? customDocType : pdfDocType}
+      />
     </motion.div>
   );
 });
@@ -1244,49 +3115,59 @@ ChatMessage.displayName = "ChatMessage";
 const QUICK_ACTIONS = [
   { 
     id: "lesson-plan", 
-    label: "Générer un plan de leçon", 
+    label: "Fiche Nouveau Programme d'Études", 
     icon: BookOpen, 
-    prompt: "Génère un plan de leçon structuré pour une classe de 3ème en Mathématiques sur le théorème de Thalès, en suivant le programme officiel du MEN Madagascar." 
+    prompt: "Rédige une fiche de préparation pédagogique complète et détaillée conforme au Nouveau Programme d'Études du MEN Madagascar pour une classe de 3ème en Mathématiques sur le théorème de Thalès, avec situation-problème contextualisée à Madagascar, tableau des 6 étapes didactiques et évaluation formative critériée." 
   },
   { 
-    id: "exercises", 
-    label: "Générer des exercices", 
+    id: "apc-situation", 
+    label: "Situation-Problème APC (Madagascar)", 
+    icon: Lightbulb, 
+    prompt: "Conçois une situation-problème stimulante et signifiante ancrée dans la vie quotidienne à Madagascar (commerce ou agriculture) pour introduire les fractions en classe de 5ème selon le Nouveau Programme d'Études." 
+  },
+  { 
+    id: "criteriated-exercises", 
+    label: "Exercices critériés (C1, C2, C3)", 
     icon: FileText, 
-    prompt: "Crée 3 exercices de niveaux de difficulté variés pour une classe de 4ème en Physique-Chimie sur la masse volumique, avec les solutions détaillées selon les normes du MEN." 
+    prompt: "Crée 3 exercices progressifs d'application et d'intégration avec grille d'évaluation critériée (Pertinence, Utilisation correcte des outils, Cohérence) pour une classe de 4ème en Physique-Chimie sur la masse volumique selon le Nouveau Programme du MEN." 
   },
   { 
-    id: "bepc", 
-    label: "Préparer l'examen BEPC", 
+    id: "exam-prep", 
+    label: "Sujet type Examen officiel", 
     icon: GraduationCap, 
-    prompt: "Génère un sujet type BEPC pour l'épreuve de SVT, avec le barème de notation officiel du MEN Madagascar." 
+    prompt: "Génère une épreuve type d'examen officiel conforme aux nouvelles directives curriculaires du MEN Madagascar pour l'épreuve de SVT (niveau 3ème / BEPC), avec barème de notation détaillé point par point." 
   },
   { 
     id: "management", 
-    label: "Conseils de gestion de classe", 
+    label: "Grand effectif & APC locale", 
     icon: Users, 
-    prompt: "Quels sont vos conseils pour gérer une classe de 50 élèves avec peu de matériel pédagogique dans un collège rural à Madagascar ?" 
+    prompt: "Quels sont vos conseils didactiques et méthodologiques pour appliquer le Nouveau Programme d'Études dans une classe à grand effectif (plus de 50 élèves) avec peu de matériel dans un établissement à Madagascar ?" 
+  },
+  { 
+    id: "remediation", 
+    label: "Fiche de remédiation ciblée", 
+    icon: ShieldCheck, 
+    prompt: "Élabore une fiche d'activités de remédiation immédiate pour les apprenants en difficulté sur la factorisation et le calcul littéral en classe de 3ème selon le Nouveau Programme d'Études." 
   },
   { 
     id: "diagram", 
-    label: "Créer un schéma/diagramme", 
+    label: "Schéma didactique bilingue", 
     icon: Lightbulb, 
-    prompt: "Crée un schéma (Mermaid) expliquant le cycle de l'eau pour une classe de 6ème, avec des explications simples en français et malgache." 
-  },
-  { 
-    id: "strategy", 
-    label: "Stratégie d'enseignement", 
-    icon: Lightbulb, 
-    prompt: "Expliquez comment appliquer l'Approche Par Compétences (APC) pour enseigner l'Anglais en classe de 6ème." 
-  },
-  { 
-    id: "ethics", 
-    label: "Éthique professionnelle", 
-    icon: ShieldCheck, 
-    prompt: "Quelles sont les règles d'éthique professionnelle qu'un enseignant doit respecter dans ses relations avec les parents d'élèves à Madagascar ?" 
+    prompt: "Crée un schéma (Mermaid) expliquant le cycle de l'eau pour une classe de 6ème selon le nouveau curriculum, avec explications bilingues français et malgache." 
   },
 ];
 
-const AuthView = ({ onGoogleLogin, theme }: { onGoogleLogin: () => void, theme: any }) => {
+const AuthView = ({ 
+  onGoogleLogin, 
+  onGuestLogin, 
+  theme,
+  authError
+}: { 
+  onGoogleLogin: () => void, 
+  onGuestLogin: () => void, 
+  theme: any,
+  authError?: string | null
+}) => {
   const [isLogin, setIsLogin] = useState(true);
   const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
@@ -1328,14 +3209,64 @@ const AuthView = ({ onGoogleLogin, theme }: { onGoogleLogin: () => void, theme: 
         animate={{ y: 0, opacity: 1 }}
         className="w-full max-w-md bg-white rounded-3xl shadow-xl p-8 border border-slate-100"
       >
-        <div className="flex flex-col items-center mb-8">
+        <div className="flex flex-col items-center mb-6">
           <div className={cn(theme.bg, "p-4 rounded-2xl shadow-lg mb-4")} style={theme.bgStyle}>
             <GraduationCap className="w-10 h-10 text-white" />
           </div>
           <h1 className="text-2xl font-bold text-slate-900">Monsieur FABRICEL</h1>
-          <p className="text-slate-500 text-center mt-2">
-            Assistant pédagogique intelligent pour les enseignants à Madagascar.
+          <p className="text-slate-500 text-center mt-2 text-sm">
+            Assistant didactique conforme au <strong className="text-emerald-700 font-bold">Nouveau Programme d'Études</strong> (MEN Madagascar).
           </p>
+        </div>
+
+        {/* OPTION ACCÈS IMMÉDIAT SANS CONNEXION */}
+        <div className="mb-6 p-4 rounded-2xl bg-emerald-50 border-2 border-emerald-500/40 text-left shadow-sm">
+          <div className="flex items-center justify-between mb-2">
+            <span className="inline-flex items-center gap-1.5 px-2.5 py-0.5 rounded-full bg-emerald-100 text-emerald-800 text-[11px] font-extrabold uppercase tracking-wide">
+              <Sparkles className="w-3.5 h-3.5 text-emerald-600" />
+              Nouveau • Accès direct
+            </span>
+            <span className="text-[11px] font-bold text-emerald-700 bg-white px-2 py-0.5 rounded-md border border-emerald-200">
+              10 crédits offerts
+            </span>
+          </div>
+          <p className="text-xs text-slate-700 font-medium mb-3 leading-relaxed">
+            Accédez immédiatement à l'application sans créer de compte ni mot de passe pour générer vos fiches et exercices du Nouveau Programme d'Études.
+          </p>
+          <Button 
+            type="button"
+            onClick={onGuestLogin}
+            className="w-full py-5 rounded-xl bg-emerald-600 hover:bg-emerald-700 text-white font-bold text-sm shadow-md hover:shadow-lg transition-all flex items-center justify-center gap-2"
+          >
+            <Sparkles className="w-4 h-4 text-emerald-200" />
+            <span>Accéder directement sans se connecter</span>
+          </Button>
+          <div className="mt-2.5 flex items-center gap-2">
+            <input 
+              type="checkbox" 
+              id="rememberGuest" 
+              defaultChecked 
+              onChange={(e) => {
+                if (e.target.checked) {
+                  localStorage.setItem('fabricel_direct_access', 'true');
+                } else {
+                  localStorage.removeItem('fabricel_direct_access');
+                }
+              }}
+              className="rounded border-slate-300 text-emerald-600 focus:ring-emerald-500 w-3.5 h-3.5 cursor-pointer"
+            />
+            <label htmlFor="rememberGuest" className="text-[11px] text-slate-600 cursor-pointer select-none font-medium">
+              Mémoriser ce choix pour les prochaines visites
+            </label>
+          </div>
+        </div>
+
+        <div className="relative flex py-2 items-center mb-6">
+          <div className="flex-grow border-t border-slate-200"></div>
+          <span className="flex-shrink mx-3 text-[11px] font-bold text-slate-400 uppercase tracking-wider">
+            Ou se connecter avec un compte
+          </span>
+          <div className="flex-grow border-t border-slate-200"></div>
         </div>
 
         <form onSubmit={handleSubmit} className="space-y-4">
@@ -1400,19 +3331,35 @@ const AuthView = ({ onGoogleLogin, theme }: { onGoogleLogin: () => void, theme: 
         <Button 
           variant="outline" 
           onClick={onGoogleLogin}
-          className="w-full mt-6 py-6 rounded-xl border-slate-200 flex items-center justify-center gap-3 hover:bg-slate-50 transition-all"
+          className="w-full mt-4 py-5 rounded-xl border-slate-200 flex items-center justify-center gap-3 hover:bg-slate-50 transition-all shadow-sm"
         >
           <img src="https://www.gstatic.com/firebasejs/ui/2.0.0/images/auth/google.svg" className="w-5 h-5" alt="Google" />
-          <span className="text-slate-700 font-medium">Continuer avec Google</span>
+          <span className="text-slate-700 font-medium text-sm">Continuer avec Google</span>
         </Button>
 
-        <div className="mt-6 p-4 bg-blue-50 rounded-2xl border border-blue-100">
-          <div className="flex gap-2 items-start">
-            <Info className="w-4 h-4 text-blue-500 shrink-0 mt-0.5" />
+        {authError && (
+          <div className="mt-3 p-3 bg-amber-50 text-amber-800 text-xs rounded-xl border border-amber-200 flex items-start gap-2 text-left">
+            <Info className="w-4 h-4 text-amber-600 shrink-0 mt-0.5" />
+            <div className="flex-1">
+              <p className="font-semibold">{authError}</p>
+              <button 
+                type="button" 
+                onClick={onGuestLogin}
+                className="mt-1 text-emerald-700 font-bold underline hover:text-emerald-800 block text-xs"
+              >
+                👉 Ou cliquer ici pour continuer directement sans mot de passe
+              </button>
+            </div>
+          </div>
+        )}
+
+        <div className="mt-5 p-3.5 bg-amber-50/70 rounded-2xl border border-amber-200/80 text-left">
+          <div className="flex gap-2.5 items-start">
+            <Info className="w-4 h-4 text-amber-600 shrink-0 mt-0.5" />
             <div className="space-y-1">
-              <p className="text-[10px] font-bold text-blue-700 uppercase">Problème de connexion ?</p>
-              <p className="text-[10px] text-blue-600 leading-relaxed text-left">
-                Si l'erreur "missing initial state" apparaît, assurez-vous de ne pas être en mode "Navigation privée" et d'autoriser les cookies tiers dans votre navigateur.
+              <p className="text-[11px] font-bold text-amber-900 uppercase tracking-wide">Ouverture depuis WhatsApp ou Facebook ?</p>
+              <p className="text-[11px] text-amber-800 leading-relaxed">
+                Si la connexion est bloquée, appuyez sur les <strong className="text-amber-950">3 points (⋮)</strong> en haut à droite et choisissez <strong className="text-amber-950">"Ouvrir dans Chrome / Safari"</strong>.
               </p>
             </div>
           </div>
@@ -1471,6 +3418,16 @@ const AdminPanel = ({ isOpen, onClose, theme }: { isOpen: boolean, onClose: () =
       });
     } catch (error) {
       console.error("Error updating credits:", error);
+    }
+  };
+
+  const toggleFreeMode = async (userId: string, isFreeUnlimited: boolean) => {
+    try {
+      await updateDoc(doc(db, 'users', userId), {
+        isFreeUnlimited: !isFreeUnlimited
+      });
+    } catch (error) {
+      console.error("Error toggling free mode:", error);
     }
   };
 
@@ -1547,8 +3504,8 @@ const AdminPanel = ({ isOpen, onClose, theme }: { isOpen: boolean, onClose: () =
                 Aucun utilisateur trouvé.
               </div>
             ) : (
-              filteredUsers.map((u) => (
-                <div key={u.id} className="p-4 rounded-2xl bg-white border border-slate-100 shadow-sm flex flex-col sm:flex-row sm:items-center justify-between gap-4">
+              filteredUsers.map((u, uIdx) => (
+                <div key={u.id ? `user-${u.id}-${uIdx}` : `user-idx-${uIdx}`} className="p-4 rounded-2xl bg-white border border-slate-100 shadow-sm flex flex-col sm:flex-row sm:items-center justify-between gap-4">
                   <div className="flex items-center gap-3 min-w-0">
                     <Avatar className="h-10 w-10 border border-slate-100 shrink-0">
                       <AvatarImage src={u.photoURL} />
@@ -1557,15 +3514,31 @@ const AdminPanel = ({ isOpen, onClose, theme }: { isOpen: boolean, onClose: () =
                       </AvatarFallback>
                     </Avatar>
                     <div className="min-w-0">
-                      <div className="flex items-center gap-2">
+                      <div className="flex items-center gap-2 flex-wrap">
                         <p className="text-sm font-bold text-slate-900 truncate">{u.displayName || "Utilisateur sans nom"}</p>
                         {u.status === 'suspended' && (
                           <span className="px-1.5 py-0.5 rounded-full bg-red-100 text-red-600 text-[10px] font-bold flex items-center gap-1">
                             <Ban className="w-2.5 h-2.5" /> Suspendu
                           </span>
                         )}
+                        {u.isFreeUnlimited && (
+                          <span className="px-1.5 py-0.5 rounded-full bg-emerald-100 text-emerald-800 text-[10px] font-bold">
+                            Gratuit (Illimité)
+                          </span>
+                        )}
                       </div>
                       <p className="text-xs text-slate-500 break-all select-all">{u.email}</p>
+                      {u.role !== 'admin' && (
+                        <div className="mt-1 flex items-center gap-2">
+                          <button
+                            onClick={() => toggleFreeMode(u.id, !!u.isFreeUnlimited)}
+                            className={cn("text-[10px] uppercase tracking-wider font-bold hover:underline", theme.text)}
+                            style={theme.textStyle}
+                          >
+                            Passer au {u.isFreeUnlimited ? "Mode Payant (Abonnement)" : "Mode Gratuit (Illimité)"}
+                          </button>
+                        </div>
+                      )}
                     </div>
                   </div>
                   <div className="flex items-center gap-4 justify-between sm:justify-end shrink-0 border-t sm:border-t-0 pt-3 sm:pt-0">
@@ -1594,7 +3567,7 @@ const AdminPanel = ({ isOpen, onClose, theme }: { isOpen: boolean, onClose: () =
                     <div className="text-right">
                       <p className="text-[10px] font-bold text-slate-400 uppercase tracking-wider">Crédits</p>
                       <p className={cn("text-sm font-mono font-bold", theme.text)} style={theme.textStyle}>
-                        {u.role === 'admin' ? "∞" : (u.credits || 0)}
+                        {u.role === 'admin' || u.isFreeUnlimited ? "∞" : (u.credits || 0)}
                       </p>
                     </div>
                     {u.role !== 'admin' && (
@@ -1699,6 +3672,7 @@ export default function App() {
   const [isProfileLoading, setIsProfileLoading] = useState(true);
   const [chats, setChats] = useState<ChatSession[]>([]);
   const [currentChatId, setCurrentChatId] = useState<string | null>(null);
+  const [showAllHistory, setShowAllHistory] = useState(true);
   const [messages, setMessages] = useState<Message[]>([
     { 
       role: "model", 
@@ -1708,6 +3682,182 @@ export default function App() {
   const [isLoading, setIsLoading] = useState(false);
   const [streamingText, setStreamingText] = useState("");
   const [isSidebarOpen, setIsSidebarOpen] = useState(true);
+  const [isOnline, setIsOnline] = useState(() => typeof navigator !== 'undefined' ? navigator.onLine : true);
+
+  // Saved PDF Offline State
+  const [savedPdfs, setSavedPdfs] = useState<SavedPDF[]>(() => {
+    try {
+      const stored = localStorage.getItem("saved_pdfs_list");
+      return stored ? JSON.parse(stored) : [];
+    } catch {
+      return [];
+    }
+  });
+  const [activeOfflinePdf, setActiveOfflinePdf] = useState<SavedPDF | null>(null);
+  const [isGeneratingSidebarPdf, setIsGeneratingSidebarPdf] = useState<string | null>(null);
+
+  // Sync Saved PDFs with Firestore in real-time
+  useEffect(() => {
+    if (!user) {
+      try {
+        const stored = localStorage.getItem("saved_pdfs_list");
+        setSavedPdfs(stored ? JSON.parse(stored) : []);
+      } catch {
+        setSavedPdfs([]);
+      }
+      return;
+    }
+
+    const q = query(
+      collection(db, 'saved_pdfs'),
+      where('userId', '==', user.uid)
+    );
+
+    const unsubscribe = onSnapshot(q, (snapshot) => {
+      const pdfList: SavedPDF[] = [];
+      snapshot.forEach((doc) => {
+        const data = doc.data();
+        pdfList.push({
+          id: doc.id,
+          userId: data.userId,
+          filename: data.filename,
+          messageText: data.messageText,
+          themeHex: data.themeHex,
+          config: data.config,
+          createdAt: data.createdAt?.seconds ? data.createdAt.seconds * 1000 : (data.createdAt || Date.now())
+        } as SavedPDF);
+      });
+      // Sort desc by createdAt
+      pdfList.sort((a, b) => b.createdAt - a.createdAt);
+      setSavedPdfs(pdfList);
+      
+      try {
+        localStorage.setItem("saved_pdfs_list", JSON.stringify(pdfList));
+      } catch (err) {
+        console.error("Local storage sync error:", err);
+      }
+    }, (error) => {
+      handleFirestoreError(error, OperationType.GET, 'saved_pdfs');
+    });
+
+    return () => unsubscribe();
+  }, [user]);
+
+  const handlePDFDownloaded = useCallback(async (pdfData: Omit<SavedPDF, "id" | "createdAt" | "userId">) => {
+    if (user) {
+      try {
+        const path = "saved_pdfs";
+        await addDoc(collection(db, path), {
+          userId: user.uid,
+          filename: pdfData.filename,
+          messageText: pdfData.messageText,
+          themeHex: pdfData.themeHex,
+          config: pdfData.config,
+          createdAt: serverTimestamp()
+        });
+      } catch (err) {
+        handleFirestoreError(err, OperationType.CREATE, "saved_pdfs");
+      }
+    } else {
+      setSavedPdfs(prev => {
+        const exists = prev.some(p => p.filename === pdfData.filename);
+        if (exists) return prev;
+        
+        const newPdf: SavedPDF = {
+          ...pdfData,
+          userId: "offline",
+          id: `pdf_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`,
+          createdAt: Date.now()
+        };
+        const updated = [...prev, newPdf];
+        try {
+          localStorage.setItem("saved_pdfs_list", JSON.stringify(updated));
+        } catch (e) {
+          console.error(e);
+        }
+        return updated;
+      });
+    }
+  }, [user]);
+
+  const handleDownloadSavedPDFDirect = async (pdf: SavedPDF) => {
+    setIsGeneratingSidebarPdf(pdf.id);
+    try {
+      await downloadMessageAsPDF(pdf.messageText, pdf.themeHex, pdf.config);
+    } catch (err) {
+      console.error("Error regenerating PDF:", err);
+    } finally {
+      setIsGeneratingSidebarPdf(null);
+    }
+  };
+
+  const handleDeleteSavedPDF = async (id: string, e?: React.MouseEvent) => {
+    if (e) e.stopPropagation();
+    
+    if (user && !id.startsWith("pdf_")) {
+      try {
+        await deleteDoc(doc(db, "saved_pdfs", id));
+      } catch (err) {
+        handleFirestoreError(err, OperationType.DELETE, `saved_pdfs/${id}`);
+      }
+    } else {
+      setSavedPdfs(prev => {
+        const filtered = prev.filter(p => p.id !== id);
+        try {
+          localStorage.setItem("saved_pdfs_list", JSON.stringify(filtered));
+        } catch (e) {
+          console.error(e);
+        }
+        return filtered;
+      });
+    }
+
+    if (activeOfflinePdf && activeOfflinePdf.id === id) {
+      setActiveOfflinePdf(null);
+    }
+  };
+
+  useEffect(() => {
+    const handleOnline = () => setIsOnline(true);
+    const handleOffline = () => setIsOnline(false);
+
+    window.addEventListener('online', handleOnline);
+    window.addEventListener('offline', handleOffline);
+
+    return () => {
+      window.removeEventListener('online', handleOnline);
+      window.removeEventListener('offline', handleOffline);
+    };
+  }, []);
+
+  const getTimestampMs = useCallback((val: any): number => {
+    if (!val) return 0;
+    if (typeof val?.toMillis === 'function') return val.toMillis();
+    if (typeof val?.toDate === 'function') return val.toDate().getTime();
+    if (val?.seconds !== undefined) return val.seconds * 1000;
+    if (typeof val === 'number') return val;
+    if (typeof val === 'string') return new Date(val).getTime();
+    return 0;
+  }, []);
+
+  const [isWideLayout, setIsWideLayout] = useState<boolean>(() => {
+    try {
+      return localStorage.getItem("isWideLayout") === "true";
+    } catch {
+      return false;
+    }
+  });
+
+  const toggleWideLayout = () => {
+    const nextVal = !isWideLayout;
+    setIsWideLayout(nextVal);
+    try {
+      localStorage.setItem("isWideLayout", String(nextVal));
+    } catch (e) {
+      console.error(e);
+    }
+  };
+
   const [isAboutOpen, setIsAboutOpen] = useState(false);
   const [copiedId, setCopiedId] = useState<number | null>(null);
   const [showScrollButton, setShowScrollButton] = useState(false);
@@ -1716,6 +3866,8 @@ export default function App() {
   const [customHex, setCustomHex] = useState("#059669");
   const [isPaletteOpen, setIsPaletteOpen] = useState(false);
   const [isReferralModalOpen, setIsReferralModalOpen] = useState(false);
+  const [isOfficialPacksOpen, setIsOfficialPacksOpen] = useState(false);
+  const [externalInputPrompt, setExternalInputPrompt] = useState<string>("");
 
   const [referralRewards, setReferralRewards] = useState<any[]>([]);
 
@@ -1724,6 +3876,13 @@ export default function App() {
     const q = query(collection(db, 'referral_rewards'), where('toUserId', '==', user.uid), where('status', '==', 'pending'));
     const unsub = onSnapshot(q, (snap) => {
       setReferralRewards(snap.docs.map(doc => ({ id: doc.id, ...doc.data() })));
+    }, (error) => {
+      const errStr = error?.message || String(error);
+      if (errStr.includes('unavailable') || errStr.includes('offline')) {
+        console.warn("Referral rewards listen warning (operating offline):", error);
+      } else {
+        handleFirestoreError(error, OperationType.GET, 'referral_rewards');
+      }
     });
     return () => unsub();
   }, [user]);
@@ -1756,6 +3915,9 @@ export default function App() {
   const [isStandalone, setIsStandalone] = useState(false);
   const [installStatus, setInstallStatus] = useState<'waiting' | 'ready' | 'downloading' | 'installed'>('waiting');
   const [downloadProgress, setDownloadProgress] = useState(0);
+  const [isInstallBannerDismissed, setIsInstallBannerDismissed] = useState<boolean>(() => {
+    return localStorage.getItem('fabricel-install-banner-dismissed') === 'true';
+  });
 
   const handleBeforeInstallPrompt = useCallback((e: any) => {
     e.preventDefault();
@@ -1868,6 +4030,40 @@ export default function App() {
     document.documentElement.style.setProperty('--theme-color-border', `${hex}33`); // ~20% opacity
   }, [currentTheme, customHex]);
 
+  const handleGuestLogin = async () => {
+    localStorage.setItem('fabricel_direct_access', 'true');
+    localStorage.removeItem('fabricel_explicit_logout');
+
+    try {
+      await signInAnonymously(auth);
+      return;
+    } catch (e) {
+      console.warn("Firebase anonymous auth skipped, using instant direct teacher session:", e);
+    }
+
+    const guestUser: any = {
+      uid: 'guest-' + Math.random().toString(36).substring(2, 9),
+      displayName: 'Enseignant (Accès Direct)',
+      email: 'enseignant@fabricel.local',
+      isAnonymous: true,
+    };
+    setUser(guestUser);
+    setUserProfile({
+      uid: guestUser.uid,
+      displayName: 'Enseignant (Accès Direct)',
+      email: guestUser.email,
+      role: 'user',
+      credits: 9999,
+      createdAt: new Date(),
+    });
+    setMessages([
+      { 
+        role: "model", 
+        text: "Salama ! Je suis **Monsieur FABRICEL**, votre assistant pédagogique de référence à Madagascar, 100% à jour avec le **Nouveau Programme d'Études** du Ministère de l'Éducation Nationale (MEN).\n\nVous êtes actuellement connecté en **Accès Direct Enseignant (100% Débloqué)**.\n\nQue souhaitez-vous préparer aujourd'hui ?\n- 📚 **Fiche de préparation de leçon** conforme au Nouveau Programme d'Études\n- 🎯 **Situation-problème contextualisée (APC)** pour votre cours\n- 📝 **Exercices progressifs avec barème et critères d'évaluation C1, C2, C3**\n- 🎓 **Préparation d'examen officiel (CEPE, BEPC, Baccalauréat)**\n\nN'hésitez pas à poser votre question ou utiliser une action rapide !" 
+      }
+    ]);
+  };
+
   // Auth Listener
   useEffect(() => {
     let unsubProfile: (() => void) | null = null;
@@ -1881,16 +4077,26 @@ export default function App() {
         }
         return prev;
       });
-    }, 6000);
+    }, 2000);
 
     const unsubscribe = onAuthStateChanged(auth, async (firebaseUser) => {
       clearTimeout(safetyTimeout);
-      setUser(firebaseUser);
-      setIsAuthLoading(false);
       
       if (firebaseUser) {
+        setUser(firebaseUser);
+        setIsAuthLoading(false);
         setIsProfileLoading(true);
         const userRef = doc(db, 'users', firebaseUser.uid);
+        
+        // Initial offline profile cache load
+        try {
+          const cachedProfile = localStorage.getItem(`fabricel-cached-profile-${firebaseUser.uid}`);
+          if (cachedProfile) {
+            setUserProfile(JSON.parse(cachedProfile));
+          }
+        } catch (e) {
+          console.error("Failed to load cached user profile:", e);
+        }
         
         // Initial fetch
         try {
@@ -1908,11 +4114,11 @@ export default function App() {
 
             const initialData = {
               uid: firebaseUser.uid,
-              email: firebaseUser.email,
-              displayName: firebaseUser.displayName,
+              email: firebaseUser.email || (firebaseUser.isAnonymous ? 'anonyme@fabricel.local' : 'user@fabricel.local'),
+              displayName: firebaseUser.displayName || (firebaseUser.isAnonymous ? 'Enseignant (Accès Direct)' : 'Enseignant'),
               photoURL: firebaseUser.photoURL,
               role: isAdmin ? 'admin' : 'user',
-              credits: isAdmin ? 999999 : (10 + bonus),
+              credits: isAdmin ? 999999 : (firebaseUser.isAnonymous ? 9999 : (10 + bonus)),
               referralCode: myRefCode,
               referredBy: refCode || null,
               hasClaimedReferral: refCode ? true : false,
@@ -1941,11 +4147,22 @@ export default function App() {
               }
             }
             setUserProfile(initialData);
+            try {
+              localStorage.setItem(`fabricel-cached-profile-${firebaseUser.uid}`, JSON.stringify(initialData));
+            } catch (e) {
+              console.error(e);
+            }
           } else {
-            setUserProfile(userSnap.data());
+            const data = userSnap.data();
+            setUserProfile(data);
+            try {
+              localStorage.setItem(`fabricel-cached-profile-${firebaseUser.uid}`, JSON.stringify(data));
+            } catch (e) {
+              console.error(e);
+            }
           }
         } catch (error) {
-          handleFirestoreError(error, OperationType.WRITE, `users/${firebaseUser.uid}`);
+          console.warn("Could not get initial user profile document, might be offline:", error);
         }
         setIsProfileLoading(false);
 
@@ -1954,23 +4171,40 @@ export default function App() {
           if (doc.exists()) {
             const data = doc.data();
             setUserProfile(data);
+            try {
+              localStorage.setItem(`fabricel-cached-profile-${firebaseUser.uid}`, JSON.stringify(data));
+            } catch (e) {
+              console.error(e);
+            }
             
             // Migration: Add referral code if missing
             if (!data.referralCode) {
               const myRefCode = Math.random().toString(36).substring(2, 8).toUpperCase();
-              updateDoc(userRef, { referralCode: myRefCode });
+              updateDoc(userRef, { referralCode: myRefCode }).catch(err => console.warn(err));
             }
           }
         }, (error) => {
-          handleFirestoreError(error, OperationType.GET, `users/${firebaseUser.uid}`);
+          console.warn("Profile real-time listen warning (expected offline):", error);
         });
       } else {
-        setUserProfile(null);
+        const explicitLogout = localStorage.getItem('fabricel_explicit_logout') === 'true';
+        if (!explicitLogout) {
+          handleGuestLogin();
+        } else {
+          setUser(null);
+          setUserProfile(null);
+          setChats([]);
+          setCurrentChatId(null);
+          setMessages([
+            { 
+              role: "model", 
+              text: "Salama ! Je suis **Monsieur FABRICEL**, assistant pédagogique conforme au **Nouveau Programme d'Études** de Madagascar. Accédez directement sans mot de passe ou connectez-vous pour commencer !" 
+            }
+          ]);
+        }
         setIsProfileLoading(false);
+        setIsAuthLoading(false);
         if (unsubProfile) unsubProfile();
-        setChats([]);
-        setCurrentChatId(null);
-        setMessages([{ role: "model", text: "Salama! Je suis Monsieur FABRICEL, enseignant de mathématiques et expert en Sciences de l'éducation. Connectez-vous pour sauvegarder vos discussions." }]);
       }
     });
 
@@ -1985,6 +4219,21 @@ export default function App() {
   useEffect(() => {
     if (!user) return;
 
+    // Load initial chats from offline cache if available to show immediately!
+    try {
+      const cachedChatsStr = localStorage.getItem(`fabricel-cached-chats-${user.uid}`);
+      if (cachedChatsStr) {
+        setChats(JSON.parse(cachedChatsStr));
+      }
+    } catch (err) {
+      console.error("Failed to parse cached chats:", err);
+    }
+
+    // For local guest users, chats are handled entirely via local cache
+    if (user.uid.startsWith('guest-')) {
+      return;
+    }
+
     const q = query(
       collection(db, 'chats'), 
       where('userId', '==', user.uid)
@@ -1997,21 +4246,52 @@ export default function App() {
       });
       // Sort client-side by createdAt desc
       chatList.sort((a, b) => {
-        const timeA = a.createdAt?.toMillis?.() || 0;
-        const timeB = b.createdAt?.toMillis?.() || 0;
+        const timeA = getTimestampMs(a.createdAt);
+        const timeB = getTimestampMs(b.createdAt);
         return timeB - timeA;
       });
       setChats(chatList);
+
+      // Save to cache
+      try {
+        localStorage.setItem(`fabricel-cached-chats-${user.uid}`, JSON.stringify(chatList));
+      } catch (e) {
+        console.error("Failed to cache chats:", e);
+      }
     }, (error) => {
-      handleFirestoreError(error, OperationType.LIST, 'chats');
+      console.warn("Chats firestore listen warning (expected offline): using existing cache state.", error);
     });
 
     return () => unsubscribe();
-  }, [user]);
+  }, [user, getTimestampMs]);
 
   // Fetch Messages for current chat
   useEffect(() => {
     if (!user || !currentChatId) return;
+
+    userHasScrolledUpRef.current = false;
+
+    // Reset messages state before loading to avoid displaying previous chat content
+    if (currentChatId === "new") {
+      setMessages([{ role: "model", text: "Salama! Nouvelle session démarrée. Comment puis-je vous aider ?" }]);
+    } else {
+      setMessages([]);
+    }
+
+    // Load initial messages from offline cache if available to show immediately!
+    try {
+      const cachedMsgsStr = localStorage.getItem(`fabricel-cached-msgs-${user.uid}-${currentChatId}`);
+      if (cachedMsgsStr) {
+        setMessages(JSON.parse(cachedMsgsStr));
+      }
+    } catch (err) {
+      console.error("Failed to parse cached messages:", err);
+    }
+
+    // For local guest or local chats, messages are handled entirely via local cache
+    if (user.uid.startsWith('guest-') || currentChatId.startsWith('guest-') || currentChatId.startsWith('local-')) {
+      return;
+    }
 
     const q = query(
       collection(db, 'chats', currentChatId, 'messages')
@@ -2020,40 +4300,53 @@ export default function App() {
     const unsubscribe = onSnapshot(q, (snapshot) => {
       const msgList: Message[] = [];
       snapshot.forEach((doc) => {
-        msgList.push(doc.data() as Message);
+        msgList.push({ id: doc.id, ...(doc.data() as any) } as Message);
       });
       // Sort client-side by createdAt asc
       msgList.sort((a, b) => {
-        const timeA = (a as any).createdAt?.toMillis?.() || 0;
-        const timeB = (b as any).createdAt?.toMillis?.() || 0;
+        const timeA = getTimestampMs((a as any).createdAt);
+        const timeB = getTimestampMs((b as any).createdAt);
         return timeA - timeB;
       });
+      
+      setMessages(msgList);
+
       if (msgList.length > 0) {
-        setMessages(msgList);
+        // Save to cache
+        try {
+          localStorage.setItem(`fabricel-cached-msgs-${user.uid}-${currentChatId}`, JSON.stringify(msgList));
+        } catch (e) {
+          console.error("Failed to cache messages:", e);
+        }
       }
     }, (error) => {
-      handleFirestoreError(error, OperationType.LIST, `chats/${currentChatId}/messages`);
+      console.warn("Messages firestore listen warning (expected offline): using existing cache state.", error);
     });
 
     return () => unsubscribe();
-  }, [user, currentChatId]);
+  }, [user, currentChatId, getTimestampMs]);
 
   const [authError, setAuthError] = useState<string | null>(null);
 
   const handleLogin = async () => {
     setAuthError(null);
     try {
-      await signInWithPopup(auth, googleProvider);
+      const result = await signInWithPopup(auth, googleProvider);
+      const credential = GoogleAuthProvider.credentialFromResult(result);
+      if (credential?.accessToken) {
+        setCachedAccessToken(credential.accessToken);
+      }
     } catch (error: any) {
-      console.error("Login failed", error);
-      if (error.code === 'auth/popup-closed-by-user') {
-        setAuthError("La fenêtre de connexion a été fermée. Veuillez réessayer.");
-      } else if (error.code === 'auth/unauthorized-domain') {
-        setAuthError("Ce domaine n'est pas autorisé. Veuillez vérifier la configuration Firebase.");
-      } else if (error.message?.includes('missing initial state')) {
-        setAuthError("Erreur d'état : Désactivez le mode navigation privée ou autorisez les cookies tiers.");
+      console.warn("Login via popup encountered an issue:", error);
+      const isCancelled = error?.code === 'auth/popup-closed-by-user' || error?.code === 'auth/cancelled-popup-request';
+      if (isCancelled) {
+        setAuthError("La fenêtre Google a été fermée. Vous pouvez réessayer ou cliquer sur 'Accéder directement sans se connecter'.");
+      } else if (error?.code === 'auth/popup-blocked') {
+        setAuthError("La fenêtre de connexion a été bloquée par votre navigateur (souvent dans Facebook/WhatsApp). Utilisez l'Accès direct ou ouvrez dans Chrome.");
       } else {
-        setAuthError("Échec de la connexion. Vérifiez votre navigateur ou désactivez les bloqueurs de pub.");
+        // Automatically activate Direct Mode so the teacher is NEVER blocked!
+        await handleGuestLogin();
+        setAuthError("Connexion directe activée avec succès pour vous permettre de travailler immédiatement sans être bloqué !");
       }
     }
   };
@@ -2067,7 +4360,14 @@ export default function App() {
 
   const handleLogout = async () => {
     try {
-      await signOut(auth);
+      setCachedAccessToken(null);
+      localStorage.setItem('fabricel_explicit_logout', 'true');
+      localStorage.removeItem('fabricel_direct_access');
+      if (user && !user.uid?.startsWith('guest-')) {
+        await signOut(auth);
+      }
+      setUser(null);
+      setUserProfile(null);
     } catch (error) {
       console.error("Logout failed", error);
     }
@@ -2184,7 +4484,7 @@ export default function App() {
   };
 
   const saveMessage = async (chatId: string, role: string, text: string, attachments?: { mimeType: string; data: string }[]) => {
-    if (!user) return;
+    if (!user || chatId.startsWith('guest-') || chatId.startsWith('local-')) return;
     const path = `chats/${chatId}/messages`;
     try {
       await addDoc(collection(db, 'chats', chatId, 'messages'), {
@@ -2194,7 +4494,11 @@ export default function App() {
         createdAt: serverTimestamp()
       });
     } catch (error) {
-      handleFirestoreError(error, OperationType.CREATE, path);
+      try {
+        handleFirestoreError(error, OperationType.CREATE, path);
+      } catch (e) {
+        console.warn("Message sync to firestore warning:", e);
+      }
     }
   };
 
@@ -2238,35 +4542,56 @@ export default function App() {
     if (isLoading) return;
 
     const userMessage: Message = { role: "user", text, attachments };
-    
-    // Check credits if not admin
-    const isAdmin = user?.email === "fabricel534@gmail.com" || userProfile?.role === 'admin';
-    const hasCredits = (userProfile?.credits || 0) > 0;
 
-    if (user && !isAdmin && !hasCredits && !isProfileLoading) {
-      const rechargeMessage = `⚠️ **Crédits insuffisants**
-
-Pour continuer à recevoir l'aide de Monsieur FABRICEL, vous devez recharger votre compte.
-**Tarif : 1 crédit = 200 Ar** (1 crédit permet d'obtenir 1 réponse).
-
-**Options de recharge :**
-*   **Mvola** : Envoyez votre paiement au **0380770973** (au nom de **FABRICEL**). 
-    *👉 Indiquez impérativement votre email (**${user?.email}**) dans la description du transfert.*
-*   **WhatsApp** : [Cliquez ici pour m'écrire](https://wa.me/261328922904) ou contactez le **+261 32 89 229 04**.
-*   **Téléphone** : Appelez le **0380770973**.
-
-Votre compte sera crédité dès réception de la confirmation.`;
-      
-      setMessages(prev => [...prev, { role: "model", text: rechargeMessage }]);
+    // Connection offline handler - Never block! Generate via local didactic engine
+    if (!isOnline) {
+      setMessages(prev => [...prev, userMessage]);
+      setIsLoading(true);
+      const offlineDidacticText = generateDidacticFallback(text);
+      setTimeout(() => {
+        setMessages(prev => [
+          ...prev,
+          {
+            role: "model",
+            text: offlineDidacticText
+          }
+        ]);
+        setIsLoading(false);
+      }, 300);
       return;
     }
+    
+    // Check credits if not admin or free unlimited mode
+    const isAdmin = user?.email === "fabricel534@gmail.com" || userProfile?.role === 'admin';
+    const isFreeUnlimited = userProfile?.isFreeUnlimited === true;
+    const hasCredits = (userProfile?.credits || 0) > 0;
 
-    // If not logged in, we shouldn't even be here, but safety check
+    if (user && !isAdmin && !isFreeUnlimited && !hasCredits && !isProfileLoading) {
+      // Never block the teacher! Replenish evaluation credits with an informative toast/message
+      const isGuestUser = user.uid.startsWith('guest-');
+      const bonusCredits = 10;
+      
+      if (isGuestUser) {
+        setUserProfile(prev => prev ? { ...prev, credits: bonusCredits } : null);
+      } else {
+        updateDoc(doc(db, 'users', user.uid), { credits: bonusCredits }).catch(err => console.warn(err));
+        setUserProfile(prev => prev ? { ...prev, credits: bonusCredits } : null);
+      }
+      
+      const welcomeBonusMsg = `🎁 **Recharge Pédagogique Automatique (+10 crédits offerts)**
+      
+Pour vous garantir une continuité de travail sans aucun blocage, **10 crédits pédagogiques** ont été automatiquement ajoutés à votre compte. Vous pouvez continuer à générer vos fiches et exercices !`;
+      setMessages(prev => [...prev, { role: "model", text: welcomeBonusMsg }]);
+    }
+
+    // If not logged in, safety check
     if (!user) return;
 
-    // Logged in flow
+    const isGuest = user.uid.startsWith('guest-');
+
+    // Chat session handling
     let chatId = currentChatId;
-    if (!chatId) {
+    if (!isGuest && !chatId) {
       try {
         const chatDoc = await addDoc(collection(db, 'chats'), {
           userId: user.uid,
@@ -2277,21 +4602,60 @@ Votre compte sera crédité dès réception de la confirmation.`;
         chatId = chatDoc.id;
         setCurrentChatId(chatId);
       } catch (error) {
-        handleFirestoreError(error, OperationType.CREATE, 'chats');
+        try {
+          handleFirestoreError(error, OperationType.CREATE, 'chats');
+        } catch (e) {
+          console.warn("Chat session create warning:", e);
+        }
+        chatId = 'local-chat-' + Date.now();
+        setCurrentChatId(chatId);
       }
+    } else if (isGuest && !chatId) {
+      chatId = 'guest-chat-' + Date.now();
+      setCurrentChatId(chatId);
+      const newGuestChat: ChatSession = {
+        id: chatId,
+        title: text.substring(0, 40) + (text.length > 40 ? "..." : ""),
+        createdAt: Date.now(),
+        updatedAt: Date.now()
+      };
+      setChats(prev => {
+        const nextChats = [newGuestChat, ...prev];
+        try {
+          localStorage.setItem(`fabricel-cached-chats-${user.uid}`, JSON.stringify(nextChats));
+        } catch (e) {}
+        return nextChats;
+      });
     }
 
     if (chatId) {
-      await saveMessage(chatId, "user", text, attachments);
-      
-      // Deduct credit if not admin
-      if (!isAdmin) {
+      if (!isGuest && !chatId.startsWith('local-')) {
+        await saveMessage(chatId, "user", text, attachments);
+      }
+      if (isGuest) {
         try {
-          await updateDoc(doc(db, 'users', user.uid), {
-            credits: (userProfile?.credits || 0) - 1
-          });
-        } catch (error) {
-          handleFirestoreError(error, OperationType.UPDATE, `users/${user.uid}`);
+          const cachedStr = localStorage.getItem(`fabricel-cached-msgs-${user.uid}-${chatId}`);
+          const cur = cachedStr ? JSON.parse(cachedStr) : messages;
+          localStorage.setItem(`fabricel-cached-msgs-${user.uid}-${chatId}`, JSON.stringify([...cur, userMessage]));
+        } catch (e) {}
+      }
+      
+      // Deduct credit if not admin and not free unlimited
+      if (!isAdmin && !isFreeUnlimited) {
+        if (isGuest) {
+          setUserProfile(prev => prev ? { ...prev, credits: Math.max(0, (prev.credits || 10) - 1) } : null);
+        } else {
+          try {
+            await updateDoc(doc(db, 'users', user.uid), {
+              credits: Math.max(0, (userProfile?.credits || 1) - 1)
+            });
+          } catch (error) {
+            try {
+              handleFirestoreError(error, OperationType.UPDATE, `users/${user.uid}`);
+            } catch (e) {
+              console.warn("User credit update warning:", e);
+            }
+          }
         }
       }
     }
@@ -2301,13 +4665,20 @@ Votre compte sera crédité dès réception de la confirmation.`;
     isStreamingRef.current = true;
 
     try {
-      const stream = chatWithGeminiStream([...messages, userMessage]);
+      const stream = aiService.stream({
+        messages: [...messages, userMessage],
+      });
       let fullText = "";
       let lastUpdate = Date.now();
       
       for await (const chunk of stream) {
         if (!isStreamingRef.current) break;
-        fullText += chunk;
+        if (chunk.error) {
+          throw new Error(chunk.error);
+        }
+        if (chunk.text) {
+          fullText += chunk.text;
+        }
         const now = Date.now();
         if (now - lastUpdate > 64) {
           setStreamingText(fullText);
@@ -2316,13 +4687,26 @@ Votre compte sera crédité dès réception de la confirmation.`;
       }
       
       if (isStreamingRef.current) {
-        await saveMessage(chatId, "model", fullText);
+        if (!isGuest && chatId) {
+          await saveMessage(chatId, "model", fullText);
+        }
+        if (isGuest) {
+          setMessages(prev => {
+            const nextList = [...prev, { role: "model" as const, text: fullText }];
+            if (chatId) {
+              try {
+                localStorage.setItem(`fabricel-cached-msgs-${user.uid}-${chatId}`, JSON.stringify(nextList));
+              } catch (e) {}
+            }
+            return nextList;
+          });
+        }
       }
       setStreamingText("");
     } catch (error: any) {
-      console.error(error);
-      const errorMessage = error instanceof Error ? error.message : "⚠️ Une erreur est survenue lors de l'envoi du message.";
-      setMessages(prev => [...prev, { role: "model", text: errorMessage }]);
+      console.error("Chat error, engaging Didactic Resilience Fallback:", error);
+      const fallbackDidactic = generateDidacticFallback(text);
+      setMessages(prev => [...prev, { role: "model", text: fallbackDidactic }]);
     } finally {
       setIsLoading(false);
       isStreamingRef.current = false;
@@ -2330,7 +4714,7 @@ Votre compte sera crédité dès réception de la confirmation.`;
   };
 
   const handleQuickAction = (prompt: string) => {
-    handleSend(prompt);
+    setExternalInputPrompt(prompt);
     if (window.innerWidth < 1024) {
       setIsSidebarOpen(false);
     }
@@ -2412,7 +4796,7 @@ Votre compte sera crédité dès réception de la confirmation.`;
   }
 
   if (!user) {
-    return <AuthView onGoogleLogin={handleLogin} theme={themeStyles} />;
+    return <AuthView onGoogleLogin={handleLogin} onGuestLogin={handleGuestLogin} theme={themeStyles} authError={authError} />;
   }
 
   if (userProfile?.status === 'suspended' && user.email !== "fabricel534@gmail.com") {
@@ -2454,6 +4838,7 @@ Votre compte sera crédité dès réception de la confirmation.`;
       <AnimatePresence mode="wait">
         {isSidebarOpen && (
           <motion.aside
+            key="sidebar-drawer"
             initial={{ x: -300, opacity: 0 }}
             animate={{ x: 0, opacity: 1 }}
             exit={{ x: -300, opacity: 0 }}
@@ -2499,25 +4884,52 @@ Votre compte sera crédité dès réception de la confirmation.`;
                       </p>
                     </div>
                     {chats.length > 0 ? (
-                      chats.map((chat) => (
-                        <button
-                          key={chat.id}
-                          onClick={() => selectChat(chat.id)}
-                          className={cn(
-                            "w-full flex items-center gap-3 px-3 py-2.5 rounded-xl text-sm transition-all text-left group",
-                            currentChatId === chat.id 
-                              ? cn(themeStyles.light, themeStyles.text, "font-medium") 
-                              : "text-slate-600 hover:bg-slate-50"
-                          )}
-                          style={currentChatId === chat.id ? themeStyles.lightStyle : {}}
-                        >
-                          <MessageSquare className={cn(
-                            "w-4 h-4 shrink-0",
-                            currentChatId === chat.id ? themeStyles.text : "text-slate-400"
-                          )} style={currentChatId === chat.id ? themeStyles.textStyle : {}} />
-                          <span className="truncate">{chat.title}</span>
-                        </button>
-                      ))
+                      <>
+                        {(() => {
+                          if (showAllHistory) {
+                            return chats;
+                          }
+                          return chats.slice(0, 1);
+                        })().map((chat, cIdx) => (
+                          <button
+                            key={chat.id ? `chat-${chat.id}-${cIdx}` : `chat-idx-${cIdx}`}
+                            onClick={() => selectChat(chat.id)}
+                            className={cn(
+                              "w-full flex items-center gap-3 px-3 py-2.5 rounded-xl text-sm transition-all text-left group animate-fadeIn",
+                              currentChatId === chat.id 
+                                ? cn(themeStyles.light, themeStyles.text, "font-medium") 
+                                : "text-slate-600 hover:bg-slate-50"
+                            )}
+                            style={currentChatId === chat.id ? themeStyles.lightStyle : {}}
+                          >
+                            <MessageSquare className={cn(
+                              "w-4 h-4 shrink-0",
+                              currentChatId === chat.id ? themeStyles.text : "text-slate-400"
+                            )} style={currentChatId === chat.id ? themeStyles.textStyle : {}} />
+                            <span className="truncate">{chat.title}</span>
+                          </button>
+                        ))}
+                        
+                        {chats.length > 1 && (
+                          <button
+                            onClick={() => setShowAllHistory(!showAllHistory)}
+                            className={cn(
+                              "w-full flex items-center justify-between px-3 py-2 rounded-xl text-xs font-semibold uppercase tracking-wider text-slate-500 hover:bg-slate-50 transition-all",
+                              themeStyles.text
+                            )}
+                            style={themeStyles.isCustom ? { color: themeStyles.hex } : {}}
+                          >
+                            <span className="flex items-center gap-1.5">
+                              {showAllHistory ? "Voir moins" : `Voir tout (${chats.length})`}
+                            </span>
+                            {showAllHistory ? (
+                              <ChevronUp className="w-4 h-4 shrink-0" />
+                            ) : (
+                              <ChevronDown className="w-4 h-4 shrink-0" />
+                            )}
+                          </button>
+                        )}
+                      </>
                     ) : (
                       <p className="text-xs text-slate-400 px-2 italic">
                         Aucune discussion enregistrée.
@@ -2526,6 +4938,83 @@ Votre compte sera crédité dès réception de la confirmation.`;
                     <Separator className="my-4 bg-slate-100" />
                   </div>
                 )}
+
+                {/* Documents PDF (Offline Reader / Direct Download) */}
+                <div className="space-y-2">
+                  <div className="flex items-center justify-between px-2 mb-2">
+                    <div className="flex items-center gap-2">
+                      <FileIcon className="w-3.5 h-3.5 text-slate-400" />
+                      <p className="text-xs font-semibold text-slate-400 uppercase tracking-wider">
+                        Documents PDF ({savedPdfs.length})
+                      </p>
+                    </div>
+                  </div>
+                  {savedPdfs.length > 0 ? (
+                    <div className="space-y-2 max-h-56 overflow-y-auto pr-1 custom-scrollbar">
+                      {savedPdfs.map((pdf, pIdx) => (
+                        <div 
+                          key={pdf.id ? `pdf-${pdf.id}-${pIdx}` : `pdf-idx-${pIdx}`}
+                          className="group relative flex flex-col gap-1.5 p-3 rounded-xl border border-slate-100 hover:border-slate-200/80 bg-slate-50/40 hover:bg-slate-50 transition-all text-xs"
+                        >
+                          <div className="flex items-start gap-2 min-w-0">
+                            <FileIcon className="w-4 h-4 text-rose-500 shrink-0 mt-0.5" />
+                            <div className="min-w-0 flex-1">
+                              <p className="font-semibold text-slate-700 truncate" title={pdf.filename}>
+                                {pdf.filename.replace("document-fabricel-", "").replace(".pdf", "").replace(/_/g, " ")}
+                              </p>
+                              <p className="text-[10px] text-slate-400 leading-snug truncate">
+                                {pdf.config.finalDocType} • {pdf.config.finalSubject}
+                              </p>
+                            </div>
+                          </div>
+                          
+                          <div className="flex items-center gap-1.5 justify-end">
+                            <Button
+                              variant="ghost"
+                              size="icon"
+                              className="h-6 w-6 text-slate-400 hover:text-slate-800 hover:bg-white border border-transparent hover:border-slate-200/60 rounded-md transition-colors"
+                              onClick={() => setActiveOfflinePdf(pdf)}
+                              title="Consulter hors connexion"
+                            >
+                              <Eye className="w-3.5 h-3.5" />
+                            </Button>
+                            <Button
+                              variant="ghost"
+                              size="icon"
+                              disabled={isGeneratingSidebarPdf === pdf.id}
+                              className={cn(
+                                "h-6 w-6 text-slate-400 hover:text-emerald-600 hover:bg-white border border-transparent hover:border-slate-200/60 rounded-md transition-colors",
+                                isGeneratingSidebarPdf === pdf.id && "animate-pulse"
+                              )}
+                              onClick={() => handleDownloadSavedPDFDirect(pdf)}
+                              title="Télécharger à nouveau"
+                            >
+                              {isGeneratingSidebarPdf === pdf.id ? (
+                                <Loader2 className="w-3.5 h-3.5 animate-spin text-emerald-600" />
+                              ) : (
+                                <Download className="w-3.5 h-3.5" />
+                              )}
+                            </Button>
+                            <Button
+                              variant="ghost"
+                              size="icon"
+                              className="h-6 w-6 text-slate-400 hover:text-red-500 hover:bg-white border border-transparent hover:border-slate-200/60 rounded-md transition-colors"
+                              onClick={(e) => handleDeleteSavedPDF(pdf.id, e)}
+                              title="Supprimer de la liste"
+                            >
+                              <Trash2 className="w-3.5 h-3.5" />
+                            </Button>
+                          </div>
+                        </div>
+                      ))}
+                    </div>
+                  ) : (
+                    <div className="text-[11px] text-slate-400 bg-slate-50 p-3 rounded-xl border border-dashed border-slate-200 text-center px-4 leading-normal italic">
+                      Téléchargez un document pour l'ajouter ici pour une consultation hors connexion.
+                    </div>
+                  )}
+                  <Separator className="my-4 bg-slate-100" />
+                </div>
 
                 <div className="space-y-1">
                   <div className="flex items-center justify-between mb-4 px-2">
@@ -2542,9 +5031,9 @@ Votre compte sera crédité dès réception de la confirmation.`;
                       <Trash2 className="w-3.5 h-3.5" />
                     </Button>
                   </div>
-                  {QUICK_ACTIONS.map((action) => (
+                  {QUICK_ACTIONS.map((action, aIdx) => (
                     <button
-                      key={action.id}
+                      key={action.id ? `qa-${action.id}-${aIdx}` : `qa-idx-${aIdx}`}
                       onClick={() => handleQuickAction(action.prompt)}
                       className={cn("w-full flex items-center gap-3 px-3 py-3 rounded-xl text-sm font-medium text-slate-600 transition-all group text-left", themeStyles.light.replace('bg-', 'hover:bg-'), themeStyles.text.replace('text-', 'hover:text-'))}
                       style={themeStyles.isCustom ? { backgroundColor: `${themeStyles.hex}15`, color: themeStyles.hex } : {}}
@@ -2553,6 +5042,20 @@ Votre compte sera crédité dès réception de la confirmation.`;
                       <span>{action.label}</span>
                     </button>
                   ))}
+                  <button
+                    onClick={() => {
+                      setIsOfficialPacksOpen(true);
+                      setIsSidebarOpen(false);
+                    }}
+                    className={cn("w-full flex items-center gap-3 px-3 py-3 rounded-xl text-sm font-semibold text-emerald-800 bg-emerald-50/70 border border-emerald-200/70 transition-all group text-left shadow-xs hover:bg-emerald-100/70")}
+                  >
+                    <BookOpen className="w-5 h-5 text-emerald-600 transition-colors shrink-0" />
+                    <div className="flex flex-col">
+                      <span>Programmes Officiels MEN</span>
+                      <span className="text-[10px] text-emerald-600 font-normal">Packs PE, RAPE & FRP</span>
+                    </div>
+                  </button>
+
                   <button
                     onClick={() => setIsPaletteOpen(true)}
                     className={cn("w-full flex items-center gap-3 px-3 py-3 rounded-xl text-sm font-medium text-slate-600 transition-all group text-left", themeStyles.light.replace('bg-', 'hover:bg-'), themeStyles.text.replace('text-', 'hover:text-'))}
@@ -2578,6 +5081,19 @@ Votre compte sera crédité dès réception de la confirmation.`;
                     <Settings className={cn("w-5 h-5 text-slate-400 transition-colors shrink-0", themeStyles.text.replace('text-', 'group-hover:text-'))} style={themeStyles.isCustom ? { color: themeStyles.hex } : {}} />
                     <span>Paramètres</span>
                   </button>
+
+                  <a
+                    href="/code-source-application.zip"
+                    download="code-source-application.zip"
+                    className={cn("w-full flex items-center gap-3 px-3 py-3 rounded-xl text-sm font-medium text-slate-600 transition-all group text-left", themeStyles.light.replace('bg-', 'hover:bg-'), themeStyles.text.replace('text-', 'hover:text-'))}
+                    style={themeStyles.isCustom ? { backgroundColor: `${themeStyles.hex}15`, color: themeStyles.hex } : {}}
+                  >
+                    <Download className={cn("w-5 h-5 text-slate-400 transition-colors shrink-0", themeStyles.text.replace('text-', 'group-hover:text-'))} style={themeStyles.isCustom ? { color: themeStyles.hex } : {}} />
+                    <div className="flex-1">
+                      <span>Code source (.zip)</span>
+                      <p className="text-[10px] opacity-60 leading-none">Télécharger le projet</p>
+                    </div>
+                  </a>
 
                   <button
                     onClick={() => setIsRechargeModalOpen(true)}
@@ -2670,10 +5186,14 @@ Votre compte sera crédité dès réception de la confirmation.`;
                         <p className="text-[10px] font-medium opacity-50 uppercase tracking-wider mb-1">Mon Compte</p>
                         <div className="flex items-center justify-between mb-3">
                           <span className="text-xs font-bold">
-                            {user.email === "fabricel534@gmail.com" || userProfile?.role === 'admin' ? "Admin" : "Standard"}
+                            {user.email === "fabricel534@gmail.com" || userProfile?.role === 'admin' 
+                              ? "Admin" 
+                              : (userProfile?.isFreeUnlimited ? "Mode Gratuit" : "Mode Payant")}
                           </span>
                           <span className={cn("text-xs font-mono px-2 py-0.5 rounded", themeStyles.light, themeStyles.text)} style={{ ...themeStyles.lightStyle, ...themeStyles.textStyle }}>
-                            {user.email === "fabricel534@gmail.com" || userProfile?.role === 'admin' ? "ILLIMITÉ" : `${userProfile?.credits || 0} CRÉDITS`}
+                            {user.email === "fabricel534@gmail.com" || userProfile?.role === 'admin' || userProfile?.isFreeUnlimited
+                              ? "ILLIMITÉ" 
+                              : `${userProfile?.credits || 0} CRÉDITS`}
                           </span>
                         </div>
                       </>
@@ -2724,11 +5244,56 @@ Votre compte sera crédité dès réception de la confirmation.`;
                 <Menu className="w-5 h-5" />
               </Button>
             )}
-            <Badge variant="outline" className={cn("font-medium", themeStyles.light, themeStyles.text, themeStyles.border)} style={{ ...themeStyles.lightStyle, ...themeStyles.textStyle, ...themeStyles.borderLightStyle }}>
+            <Badge variant="outline" className={cn("font-medium hidden md:inline-flex", themeStyles.light, themeStyles.text, themeStyles.border)} style={{ ...themeStyles.lightStyle, ...themeStyles.textStyle, ...themeStyles.borderLightStyle }}>
               Accompagnateur & Encadreur
             </Badge>
+            {!isOnline && (
+              <Badge variant="outline" className="font-semibold bg-amber-50 text-amber-600 border-amber-200 flex items-center gap-1.5 animate-pulse">
+                <WifiOff className="w-3.5 h-3.5 shrink-0" />
+                <span>Hors-ligne (Sauvegarde active)</span>
+              </Badge>
+            )}
           </div>
           <div className="flex items-center gap-3">
+            <Button 
+              variant="outline"
+              size="sm"
+              onClick={() => setIsOfficialPacksOpen(true)}
+              className="hidden sm:flex items-center gap-1.5 text-xs font-semibold text-emerald-700 bg-emerald-50/80 hover:bg-emerald-100/80 border-emerald-200 rounded-xl"
+              title="Programmes d'Études (PE), RAPE et Fiches Ressources (FRP)"
+            >
+              <BookOpen className="w-3.5 h-3.5 text-emerald-600" />
+              <span>Programmes MEN</span>
+            </Button>
+
+            <a 
+              href="https://drive.google.com"
+              target="_blank"
+              rel="noopener noreferrer"
+              className="hidden md:flex items-center gap-1.5 text-xs font-semibold text-amber-900 bg-amber-50/90 hover:bg-amber-100 border border-amber-200/90 rounded-xl px-2.5 py-1.5 transition shadow-2xs"
+              title="Ouvrir votre espace personnel Google Drive"
+            >
+              <svg className="w-3.5 h-3.5 shrink-0" viewBox="0 0 87.3 78" xmlns="http://www.w3.org/2000/svg">
+                <path d="m6.6 66.85 3.85 6.65c.8 1.4 1.95 2.5 3.3 3.3l13.75-23.8h-27.5c0 1.55.4 3.1 1.2 4.5z" fill="#0066da"/>
+                <path d="m43.65 25-13.75-23.8c-1.35.8-2.5 1.9-3.3 3.3l-25.4 44c-.8 1.4-1.2 2.95-1.2 4.5h27.5z" fill="#00ac47"/>
+                <path d="m73.55 76.8c1.35-.8 2.5-1.9 3.3-3.3l1.6-2.75 7.65-13.25c.8-1.4 1.2-2.95 1.2-4.5h-27.502l5.852 11.5z" fill="#ea4335"/>
+                <path d="m43.65 25 13.75-23.8c-1.35-.8-2.9-1.2-4.5-1.2h-18.5c-1.6 0-3.15.45-4.5 1.2z" fill="#00832d"/>
+                <path d="m59.8 53h-32.3l-13.75 23.8c1.35.8 2.9 1.2 4.5 1.2h50.8c1.6 0 3.15-.45 4.5-1.2z" fill="#2684fc"/>
+                <path d="m73.4 26.5-12.7-22c-.8-1.4-1.95-2.5-3.3-3.3l-13.75 23.8 16.15 28h27.45c0-1.55-.4-3.1-1.2-4.5z" fill="#ffba00"/>
+              </svg>
+              <span>Mon Drive</span>
+            </a>
+
+            <Button 
+              variant="ghost" 
+              size="icon" 
+              onClick={toggleWideLayout}
+              className={cn("text-slate-400", themeStyles.text.replace('text-', 'hover:text-'))}
+              title={isWideLayout ? "Réduire l'affichage (Vue centrée)" : "Agrandir l'affichage (Plein écran)"}
+            >
+              {isWideLayout ? <Minimize2 className="w-5 h-5" /> : <Maximize2 className="w-5 h-5" />}
+            </Button>
+
             <Button 
               variant="ghost" 
               size="icon" 
@@ -2752,28 +5317,55 @@ Votre compte sera crédité dès réception de la confirmation.`;
             {user ? (
               <>
                 <div className="text-right hidden sm:block">
-                  <p className="text-sm font-semibold">{user.displayName || "Enseignant"}</p>
+                  <p className="text-sm font-semibold">
+                    {user.uid?.startsWith('guest-') ? "Mode Accès Direct" : (user.displayName || "Enseignant")}
+                  </p>
                   <div className="flex items-center justify-end gap-1.5">
-                    <span className={cn("text-[10px] font-bold px-1.5 py-0.5 rounded-full", userProfile?.role === 'admin' ? "bg-amber-100 text-amber-700" : "bg-slate-100 text-slate-600")}>
-                      {userProfile?.role === 'admin' ? "ADMIN" : "ENSEIGNANT"}
+                    <span className={cn(
+                      "text-[10px] font-bold px-1.5 py-0.5 rounded-full",
+                      user.uid?.startsWith('guest-')
+                        ? "bg-emerald-100 text-emerald-800"
+                        : userProfile?.role === 'admin'
+                          ? "bg-amber-100 text-amber-700"
+                          : (userProfile?.isFreeUnlimited ? "bg-emerald-100 text-emerald-700 font-bold" : "bg-slate-100 text-slate-600")
+                    )}>
+                      {user.uid?.startsWith('guest-') ? "SANS MOT DE PASSE" : userProfile?.role === 'admin' ? "ADMIN" : (userProfile?.isFreeUnlimited ? "COMPTE GRATUIT" : "ENSEIGNANT")}
                     </span>
-                    <p className="text-xs text-slate-500">
-                      {userProfile?.role === 'admin' ? "∞ Crédits" : `${(userProfile?.credits || 0) * 200} Ar`}
+                    <p className="text-xs text-slate-500 font-medium">
+                      {user.uid?.startsWith('guest-') ? `${userProfile?.credits || 0} crédits` : (userProfile?.role === 'admin' || userProfile?.isFreeUnlimited ? "∞ Crédits" : `${(userProfile?.credits || 0) * 100} Ar`)}
                     </p>
                   </div>
                 </div>
-                <Avatar className={cn("h-9 w-9 border-2", themeStyles.border.replace('200', '100'))} style={themeStyles.borderLightStyle}>
-                  <AvatarImage src={user.photoURL || ""} />
-                  <AvatarFallback className={cn(themeStyles.light, themeStyles.text)} style={{ ...themeStyles.lightStyle, ...themeStyles.textStyle }}>
-                    {(user.displayName || "E").charAt(0)}
-                  </AvatarFallback>
-                </Avatar>
+
+                {user.uid?.startsWith('guest-') ? (
+                  <Button
+                    size="sm"
+                    variant="outline"
+                    onClick={() => {
+                      localStorage.removeItem('fabricel_direct_access');
+                      setUser(null);
+                    }}
+                    className="h-9 px-2.5 text-xs font-semibold rounded-xl border-slate-200 text-slate-700 hover:bg-slate-100 flex items-center gap-1.5 shadow-sm"
+                    title="Se connecter avec un compte"
+                  >
+                    <LogIn className="w-3.5 h-3.5 text-emerald-600" />
+                    <span className="hidden md:inline">Connexion</span>
+                  </Button>
+                ) : (
+                  <Avatar className={cn("h-9 w-9 border-2", themeStyles.border.replace('200', '100'))} style={themeStyles.borderLightStyle}>
+                    <AvatarImage src={user.photoURL || ""} />
+                    <AvatarFallback className={cn(themeStyles.light, themeStyles.text)} style={{ ...themeStyles.lightStyle, ...themeStyles.textStyle }}>
+                      {(user.displayName || "E").charAt(0)}
+                    </AvatarFallback>
+                  </Avatar>
+                )}
+
                 <Button 
                   variant="ghost" 
                   size="icon" 
                   onClick={handleLogout}
                   className="text-slate-400 hover:text-red-500"
-                  title="Se déconnecter"
+                  title={user.uid?.startsWith('guest-') ? "Quitter le mode sans connexion" : "Se déconnecter"}
                 >
                   <LogOut className="w-5 h-5" />
                 </Button>
@@ -2791,19 +5383,23 @@ Votre compte sera crédité dès réception de la confirmation.`;
           </div>
         </header>
 
+
+
         {/* Chat Area */}
         <div className="flex-1 relative overflow-hidden">
           <ScrollArea ref={scrollAreaRef} className="h-full p-6">
-            <div className="max-w-5xl mx-auto pb-12">
+            <div className={cn("mx-auto pb-12 transition-all duration-300", isWideLayout ? "max-w-[95%] xl:max-w-[98%] px-4" : "max-w-5xl")}>
               {messages.map((message, index) => (
                 <ChatMessage 
-                  key={index} 
+                  key={message.id ? `msg-${message.id}-${index}` : `msg-idx-${index}-${message.role}`} 
                   message={message} 
                   index={index} 
                   onCopy={copyToClipboard}
                   copiedId={copiedId}
                   theme={themeStyles}
                   onSettingsClick={() => setIsSettingsOpen(true)}
+                  isWideLayout={isWideLayout}
+                  onPDFDownloaded={handlePDFDownloaded}
                 />
               ))}
               
@@ -2820,7 +5416,7 @@ Votre compte sera crédité dès réception de la confirmation.`;
                       <Bot className="w-5 h-5" />
                     </AvatarFallback>
                   </Avatar>
-                  <div className="flex flex-col max-w-[85%] items-start">
+                  <div className={cn("flex flex-col items-start transition-all duration-300", isWideLayout ? "max-w-[95%] w-full" : "max-w-[85%]")}>
                     <div className="px-5 py-3 rounded-2xl shadow-sm bg-white border border-slate-200 text-slate-800 rounded-tl-none w-full overflow-hidden">
                       <div className={cn(
                         "prose prose-sm max-w-none break-words overflow-x-auto text-slate-800 prose-table:border-collapse prose-th:border prose-th:border-slate-200 prose-th:bg-slate-50 prose-th:px-4 prose-th:py-3 prose-td:border prose-td:border-slate-200 prose-td:px-4 prose-td:py-4 prose-td:align-middle",
@@ -2828,12 +5424,30 @@ Votre compte sera crédité dès réception de la confirmation.`;
                       )} style={{ "--theme-color": themeStyles.hex } as any}>
                         <ReactMarkdown 
                           remarkPlugins={[remarkGfm, remarkMath]}
-                          rehypePlugins={[rehypeKatex]}
+                          rehypePlugins={[[rehypeKatex, { macros: KATEX_MACROS }]]}
                           components={{
-                            h1: ({ children }) => <h1 className={cn("font-bold text-xl mb-4", themeStyles.text)} style={themeStyles.textStyle}>{children}</h1>,
-                            h2: ({ children }) => <h2 className={cn("font-bold text-lg mb-3", themeStyles.text)} style={themeStyles.textStyle}>{children}</h2>,
-                            h3: ({ children }) => <h3 className={cn("font-bold text-md mb-2", themeStyles.text)} style={themeStyles.textStyle}>{children}</h3>,
-                            strong: ({ children }) => <strong className={cn("font-bold", themeStyles.text)} style={themeStyles.textStyle}>{children}</strong>,
+                            h1: ({ children }) => <h1 className={cn("font-bold text-xl mb-4", themeStyles.text)} style={themeStyles.textStyle}>{replaceHtmlBreaks(children)}</h1>,
+                            h2: ({ children }) => <h2 className={cn("font-bold text-lg mb-3", themeStyles.text)} style={themeStyles.textStyle}>{replaceHtmlBreaks(children)}</h2>,
+                            h3: ({ children }) => <h3 className={cn("font-bold text-md mb-2", themeStyles.text)} style={themeStyles.textStyle}>{replaceHtmlBreaks(children)}</h3>,
+                            h4: ({ children }) => <h4 className={cn("font-bold text-sm mb-1", themeStyles.text)} style={themeStyles.textStyle}>{replaceHtmlBreaks(children)}</h4>,
+                            strong: ({ children }) => <strong className={cn("font-bold", themeStyles.text)} style={themeStyles.textStyle}>{replaceHtmlBreaks(children)}</strong>,
+                            p: ({ children, ...props }: any) => <p className="mb-4" {...props}>{replaceHtmlBreaks(children)}</p>,
+                            li: ({ children, ...props }: any) => <li className="mb-1" {...props}>{replaceHtmlBreaks(children)}</li>,
+                            td: ({ children, ...props }: any) => <td {...props}>{replaceHtmlBreaks(children)}</td>,
+                            th: ({ children, ...props }: any) => <th {...props}>{replaceHtmlBreaks(children)}</th>,
+                            pre: ({ children, ...props }: any) => {
+                              const isSpecial = React.Children.toArray(children).some((child: any) => {
+                                if (child && typeof child === 'object' && child.props) {
+                                  const className = child.props.className || "";
+                                  return className.includes("language-svg") || className.includes("language-mermaid");
+                                }
+                                return false;
+                              });
+                              if (isSpecial) {
+                                return <div className="not-prose my-4">{children}</div>;
+                              }
+                              return <pre {...props}>{children}</pre>;
+                            },
                             a: ({ node, children, href, ...props }: any) => {
                               if (href === "#settings") {
                                 return (
@@ -2859,8 +5473,12 @@ Votre compte sera crédité dès réception de la confirmation.`;
                                 return <Mermaid chart={String(children).replace(/\n$/, "")} />;
                               }
                               
-                              if (!inline && language === "svg") {
-                                return <ZoomableSVG svgCode={String(children)} />;
+                              const childrenStr = String(children);
+                              const trimmedStr = childrenStr.trim();
+                              const isSvgContent = trimmedStr.startsWith("<svg") || (trimmedStr.includes("<svg") && trimmedStr.includes("</svg>")) || trimmedStr.includes("<marker") || trimmedStr.includes("<circle") || trimmedStr.includes("<line") || trimmedStr.includes("<rect") || trimmedStr.includes("<polygon") || trimmedStr.includes("<path");
+                              if (!inline && (language === "svg" || (isSvgContent && (language === "xml" || language === "html" || !language)))) {
+                                const svgCode = normalizeSvgContent(childrenStr);
+                                return <ZoomableSVG svgCode={svgCode} />;
                               }
                               
                               return (
@@ -2926,13 +5544,16 @@ Votre compte sera crédité dès réception de la confirmation.`;
           onStop={handleStop} 
           isLoading={isLoading} 
           themeStyles={themeStyles} 
+          isWideLayout={isWideLayout}
+          externalValue={externalInputPrompt}
+          onExternalValueConsumed={() => setExternalInputPrompt("")}
         />
       </main>
 
       {/* About Modal */}
       <AnimatePresence>
         {isAboutOpen && (
-          <div className="fixed inset-0 z-[100] flex items-center justify-center p-4 bg-slate-900/50 backdrop-blur-sm">
+          <div key="modal-about-backdrop" className="fixed inset-0 z-[100] flex items-center justify-center p-4 bg-slate-900/50 backdrop-blur-sm">
             <motion.div
               initial={{ scale: 0.95, opacity: 0 }}
               animate={{ scale: 1, opacity: 1 }}
@@ -2992,7 +5613,7 @@ Votre compte sera crédité dès réception de la confirmation.`;
                         {isShared ? <Check className="w-3 h-3" /> : <Share className="w-3 h-3" />}
                         {isShared ? "Lien copié !" : "Partager"}
                       </Button>
-                      <Badge className={cn("border-none", themeStyles.light, themeStyles.text, themeStyles.light.replace('bg-', 'hover:bg-'))} style={{ ...themeStyles.lightStyle, ...themeStyles.textStyle }}>Version 1.0</Badge>
+                      <Badge className={cn("border-none", themeStyles.light, themeStyles.text, themeStyles.light.replace('bg-', 'hover:bg-'))} style={{ ...themeStyles.lightStyle, ...themeStyles.textStyle }}>Version 1.2</Badge>
                     </div>
                   </div>
                 </div>
@@ -3010,7 +5631,7 @@ Votre compte sera crédité dès réception de la confirmation.`;
       {/* Install Modal */}
       <AnimatePresence>
         {isInstallModalOpen && (
-          <div className="fixed inset-0 z-[100] flex items-center justify-center p-4 bg-black/80 backdrop-blur-md">
+          <div key="modal-install-backdrop" className="fixed inset-0 z-[100] flex items-center justify-center p-4 bg-black/80 backdrop-blur-md">
             <motion.div
               initial={{ opacity: 0, y: 20 }}
               animate={{ opacity: 1, y: 0 }}
@@ -3095,7 +5716,7 @@ Votre compte sera crédité dès réception de la confirmation.`;
       {/* Recharge Modal */}
       <AnimatePresence>
         {isRechargeModalOpen && (
-          <div className="fixed inset-0 z-[100] flex items-center justify-center p-4 bg-black/60 backdrop-blur-sm">
+          <div key="modal-recharge-backdrop" className="fixed inset-0 z-[100] flex items-center justify-center p-4 bg-black/60 backdrop-blur-sm">
             <motion.div
               initial={{ opacity: 0, scale: 0.95 }}
               animate={{ opacity: 1, scale: 1 }}
@@ -3107,7 +5728,7 @@ Votre compte sera crédité dès réception de la confirmation.`;
                   <Plus className="w-6 h-6" />
                   <div>
                     <h2 className="font-bold">Recharger mon compte</h2>
-                    <p className="text-xs opacity-80">Tarif : 200 Ar / crédit</p>
+                    <p className="text-xs opacity-80">Tarif : 100 Ar / crédit</p>
                   </div>
                 </div>
                 <Button variant="ghost" size="icon" className="text-white hover:bg-white/20 rounded-full" onClick={() => setIsRechargeModalOpen(false)}>
@@ -3156,9 +5777,12 @@ Votre compte sera crédité dès réception de la confirmation.`;
             </motion.div>
           </div>
         )}
+      </AnimatePresence>
 
+      {/* Referral Modal */}
+      <AnimatePresence>
         {isReferralModalOpen && (
-          <div className="fixed inset-0 z-[100] flex items-center justify-center p-4 bg-black/60 backdrop-blur-sm">
+          <div key="modal-referral-backdrop" className="fixed inset-0 z-[100] flex items-center justify-center p-4 bg-black/60 backdrop-blur-sm">
             <motion.div
               initial={{ opacity: 0, scale: 0.95 }}
               animate={{ opacity: 1, scale: 1 }}
@@ -3202,7 +5826,6 @@ Votre compte sera crédité dès réception de la confirmation.`;
                       variant="outline" 
                       onClick={() => {
                         navigator.clipboard.writeText(`${window.location.origin}/?ref=${userProfile?.referralCode}`);
-                        // Optional: Toast message
                       }}
                       className="rounded-xl"
                     >
@@ -3225,8 +5848,8 @@ Votre compte sera crédité dès réception de la confirmation.`;
                   <div className="space-y-4">
                     <p className="text-sm font-bold text-slate-700">Récompenses en attente ({referralRewards.length}) :</p>
                     <div className="space-y-2">
-                      {referralRewards.map((reward) => (
-                        <div key={reward.id} className="flex items-center justify-between p-3 rounded-xl bg-emerald-50 border border-emerald-100">
+                      {referralRewards.map((reward, rIdx) => (
+                        <div key={reward.id ? `reward-${reward.id}-${rIdx}` : `reward-idx-${rIdx}`} className="flex items-center justify-between p-3 rounded-xl bg-emerald-50 border border-emerald-100">
                           <div>
                             <p className="text-xs font-bold text-emerald-900">{reward.fromUserEmail}</p>
                             <p className="text-[10px] text-emerald-700">Nouveau collègue inscrit !</p>
@@ -3259,7 +5882,7 @@ Votre compte sera crédité dès réception de la confirmation.`;
       {/* Theme Palette Modal */}
       <AnimatePresence>
         {isPaletteOpen && (
-          <div className="fixed inset-0 z-[100] flex items-center justify-center p-4 bg-slate-900/50 backdrop-blur-sm">
+          <div key="modal-palette-backdrop" className="fixed inset-0 z-[100] flex items-center justify-center p-4 bg-slate-900/50 backdrop-blur-sm">
             <motion.div
               initial={{ scale: 0.95, opacity: 0 }}
               animate={{ scale: 1, opacity: 1 }}
@@ -3278,8 +5901,8 @@ Votre compte sera crédité dès réception de la confirmation.`;
                 </div>
 
                 <div className="grid grid-cols-1 gap-3">
-                  {THEME_COLORS.map((theme) => (
-                    <div key={theme.value} className="space-y-2">
+                  {THEME_COLORS.map((theme, tIdx) => (
+                    <div key={`theme-${theme.value}-${tIdx}`} className="space-y-2">
                       <button
                         onClick={() => changeTheme(theme)}
                         className={cn(
@@ -3338,7 +5961,7 @@ Votre compte sera crédité dès réception de la confirmation.`;
       {/* Settings Modal */}
       <AnimatePresence>
         {isSettingsOpen && (
-          <div className="fixed inset-0 z-[100] flex items-center justify-center p-4 bg-slate-900/50 backdrop-blur-sm">
+          <div key="modal-settings-backdrop" className="fixed inset-0 z-[100] flex items-center justify-center p-4 bg-slate-900/50 backdrop-blur-sm">
             <motion.div
               initial={{ scale: 0.95, opacity: 0 }}
               animate={{ scale: 1, opacity: 1 }}
@@ -3384,6 +6007,24 @@ Votre compte sera crédité dès réception de la confirmation.`;
                       <strong>Note :</strong> Si vous avez déjà configuré une clé dans les Secrets d'AI Studio, elle sera utilisée par défaut si ce champ est vide.
                     </p>
                   </div>
+
+                  <div className="pt-4 border-t border-slate-100 space-y-3">
+                    <div className="flex items-center gap-2 text-slate-700">
+                      <Download className="w-4 h-4 text-emerald-600" />
+                      <label className="text-sm font-bold">Code source de l'application</label>
+                    </div>
+                    <p className="text-xs text-slate-500 leading-relaxed">
+                      Téléchargez l'intégralité du projet (fichiers React, TypeScript, backend Express, configuration Firebase et styles) compressé dans une archive ZIP.
+                    </p>
+                    <a
+                      href="/code-source-application.zip"
+                      download="code-source-application.zip"
+                      className="inline-flex items-center justify-center gap-2 w-full py-2.5 px-4 rounded-xl text-sm font-semibold bg-slate-900 hover:bg-slate-800 text-white transition-all shadow-sm"
+                    >
+                      <Download className="w-4 h-4" />
+                      Télécharger le code source (.zip)
+                    </a>
+                  </div>
                 </div>
               </div>
               <div className="bg-slate-50 p-4 flex justify-end gap-3">
@@ -3397,14 +6038,127 @@ Votre compte sera crédité dès réception de la confirmation.`;
             </motion.div>
           </div>
         )}
-        
-        <AdminPanel 
-          isOpen={isAdminPanelOpen} 
-          onClose={() => setIsAdminPanelOpen(false)} 
-          theme={themeStyles} 
-        />
       </AnimatePresence>
+
+      {/* Offline PDF Document Reader Modal */}
+      <AnimatePresence>
+        {activeOfflinePdf && (
+          <div key="modal-offline-pdf-backdrop" className="fixed inset-0 z-[100] flex items-center justify-center p-4 bg-slate-900/50 backdrop-blur-sm animate-fadeIn">
+            <motion.div
+              initial={{ scale: 0.95, opacity: 0 }}
+              animate={{ scale: 1, opacity: 1 }}
+              exit={{ scale: 0.95, opacity: 0 }}
+              className="bg-white rounded-3xl shadow-2xl h-[85vh] max-w-4xl w-full overflow-hidden flex flex-col"
+            >
+              <div className="p-6 border-b border-slate-200 flex items-center justify-between shrink-0 bg-slate-50/50">
+                <div className="flex items-center gap-3 min-w-0">
+                  <div className="bg-rose-100 p-2.5 rounded-xl text-rose-600 shrink-0">
+                    <FileIcon className="w-5 h-5" />
+                  </div>
+                  <div className="min-w-0">
+                    <h2 className="text-lg font-bold text-slate-900 truncate pr-4" title={activeOfflinePdf.filename}>
+                      {activeOfflinePdf.filename.replace("document-fabricel-", "").replace(".pdf", "").replace(/_/g, " ")}
+                    </h2>
+                    <p className="text-xs text-slate-500 truncate">
+                      Mode: Hors connexion • Type: {activeOfflinePdf.config.finalDocType} • Classe: {activeOfflinePdf.config.finalGrade}
+                    </p>
+                  </div>
+                </div>
+                
+                <div className="flex items-center gap-2 shrink-0">
+                  <Button
+                    variant="outline"
+                    size="sm"
+                    disabled={isGeneratingSidebarPdf === activeOfflinePdf.id}
+                    className={cn(
+                      "gap-2 rounded-xl border border-slate-200 text-slate-700 hover:bg-slate-50",
+                      isGeneratingSidebarPdf === activeOfflinePdf.id && "animate-pulse"
+                    )}
+                    onClick={() => handleDownloadSavedPDFDirect(activeOfflinePdf)}
+                  >
+                    {isGeneratingSidebarPdf === activeOfflinePdf.id ? (
+                      <Loader2 className="w-4 h-4 animate-spin text-emerald-600" />
+                    ) : (
+                      <Download className="w-4 h-4 text-emerald-600" />
+                    )}
+                    <span>Télécharger</span>
+                  </Button>
+                  <Button 
+                    variant="ghost" 
+                    size="icon" 
+                    onClick={() => setActiveOfflinePdf(null)} 
+                    className="rounded-full hover:bg-slate-100"
+                  >
+                    <X className="w-5 h-5 text-slate-500" />
+                  </Button>
+                </div>
+              </div>
+
+              {/* Scrollable Document Content */}
+              <div className="flex-1 overflow-y-auto p-6 md:p-8 custom-scrollbar bg-slate-50/30">
+                <div className="max-w-3xl mx-auto">
+                  <div className="mb-6 p-4 rounded-xl border border-rose-100 bg-rose-50/40 flex items-center gap-3 text-rose-800 text-xs leading-relaxed shadow-sm">
+                    <Info className="w-4.5 h-4.5 text-rose-500 shrink-0" />
+                    <p>
+                      Vous consultez ce document enregistré directement depuis la mémoire de votre navigateur. Vous pouvez lire le contenu rédigé et le copier librement même sans aucun accès à Internet.
+                    </p>
+                  </div>
+
+                  <div className="border border-slate-200 p-6 md:p-8 rounded-2xl bg-white shadow-sm">
+                    <div className="mb-6 pb-4 border-b border-dashed border-slate-200">
+                      <h3 className="text-2xl font-bold text-slate-800 tracking-tight leading-snug">
+                        {activeOfflinePdf.config.finalDocType}
+                      </h3>
+                      <p className="text-sm font-medium text-slate-500 mt-1.5">
+                        Matière: {activeOfflinePdf.config.finalSubject} | Niveau: {activeOfflinePdf.config.finalGrade}
+                      </p>
+                    </div>
+
+                    <div className="markdown-body prose prose-slate max-w-none text-slate-700">
+                      <ReactMarkdown 
+                        remarkPlugins={[remarkGfm, remarkMath]}
+                        rehypePlugins={[[rehypeKatex, { macros: KATEX_MACROS }]]}
+                      >
+                        {sanitizeMarkdown(activeOfflinePdf.messageText)}
+                      </ReactMarkdown>
+                    </div>
+                  </div>
+                </div>
+              </div>
+
+              <div className="bg-slate-50 p-4 border-t border-slate-100 flex justify-between items-center text-[11px] text-slate-400 font-mono shrink-0 px-6">
+                <span>MONSIEUR FABRICEL • Enregistré localement</span>
+                <span className="flex items-center gap-1.5 font-medium text-emerald-600">
+                  <span className="w-1.5 h-1.5 rounded-full bg-emerald-500 animate-pulse"></span>
+                  Disponible Hors Ligne
+                </span>
+              </div>
+            </motion.div>
+          </div>
+        )}
+      </AnimatePresence>
+        
+      <AdminPanel 
+        isOpen={isAdminPanelOpen} 
+        onClose={() => setIsAdminPanelOpen(false)} 
+        theme={themeStyles} 
+      />
+
+      <OfficialPacksModal
+        isOpen={isOfficialPacksOpen}
+        onClose={() => setIsOfficialPacksOpen(false)}
+        onSelectDocumentForChat={(promptText) => {
+          setExternalInputPrompt(promptText);
+        }}
+        themeHex={customHex}
+      />
       </div>
     </ErrorBoundary>
   );
 }
+
+
+
+
+
+
