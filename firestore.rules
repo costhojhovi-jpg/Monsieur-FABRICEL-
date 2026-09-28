@@ -1,0 +1,111 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    
+    // ===============================================================
+    // Helper Functions
+    // ===============================================================
+    function isAuthenticated() {
+      return request.auth != null;
+    }
+    
+    function isOwner(userId) {
+      return isAuthenticated() && request.auth.uid == userId;
+    }
+    
+    function isAdmin() {
+      return isAuthenticated() && 
+        (
+          (request.auth.token.email == "fabricel534@gmail.com") ||
+          (
+            exists(/databases/$(database)/documents/users/$(request.auth.uid)) && 
+            get(/databases/$(database)/documents/users/$(request.auth.uid)).data.get('role', '') == 'admin'
+          )
+        );
+    }
+
+    // ===============================================================
+    // Validation Functions
+    // ===============================================================
+    function isValidUser(data) {
+      return (!('uid' in data) || (data.uid is string && data.uid.size() > 0)) &&
+             (!('email' in data) || (data.email is string && data.email.size() > 0));
+    }
+
+    function isValidChat(data) {
+      return data.keys().hasAll(['userId', 'title', 'createdAt']) &&
+             data.userId == request.auth.uid &&
+             data.title is string && data.title.size() > 0 && data.title.size() <= 500;
+    }
+
+    function isValidMessage(data) {
+      return data.keys().hasAll(['role', 'text', 'createdAt']) &&
+             (data.role == 'user' || data.role == 'model') &&
+             data.text is string && data.text.size() > 0 && data.text.size() < 100000;
+    }
+
+    function isValidSavedPDF(data) {
+      return data.keys().hasAll(['userId', 'filename', 'messageText', 'themeHex', 'config', 'createdAt']) &&
+             data.userId == request.auth.uid &&
+             data.filename is string && data.filename.size() > 0 && data.filename.size() < 500 &&
+             data.messageText is string && data.messageText.size() > 0 && data.messageText.size() < 100000 &&
+             data.themeHex is string && data.themeHex.size() > 0 && data.themeHex.size() < 50 &&
+             data.config is map;
+    }
+
+    // ===============================================================
+    // Rules
+    // ===============================================================
+
+    // User profiles
+    match /users/{userId} {
+      allow list: if isAuthenticated();
+      allow get: if isAuthenticated() && (isOwner(userId) || isAdmin());
+      allow create: if isAuthenticated() && isOwner(userId) && isValidUser(request.resource.data);
+      allow update: if isAuthenticated() && (isOwner(userId) || isAdmin()) && isValidUser(request.resource.data);
+      allow delete: if isAdmin();
+    }
+
+    // Saved Referral Rewards
+    match /referral_rewards/{rewardId} {
+      allow list, get: if isAuthenticated() && (resource.data.toUserId == request.auth.uid || isAdmin());
+      allow create: if isAuthenticated();
+      allow update: if isAuthenticated() && (resource.data.toUserId == request.auth.uid || isAdmin());
+      allow delete: if isAdmin();
+    }
+
+    // Saved PDFs Collection
+    match /saved_pdfs/{pdfId} {
+      allow list, get: if isAuthenticated() && (resource.data.userId == request.auth.uid || isAdmin());
+      allow create: if isAuthenticated() && isValidSavedPDF(request.resource.data);
+      allow update: if isAuthenticated() && (resource.data.userId == request.auth.uid || isAdmin()) && 
+                    isValidSavedPDF(request.resource.data) &&
+                    request.resource.data.userId == resource.data.userId;
+      allow delete: if isAuthenticated() && (resource.data.userId == request.auth.uid || isAdmin());
+    }
+
+    // Chats
+    match /chats/{chatId} {
+      allow list, get: if isAuthenticated() && (resource.data.userId == request.auth.uid || isAdmin());
+      allow create: if isAuthenticated() && isValidChat(request.resource.data);
+      allow update: if isAuthenticated() && (resource.data.userId == request.auth.uid || isAdmin()) && 
+                    isValidChat(request.resource.data) &&
+                    request.resource.data.userId == resource.data.userId;
+      allow delete: if isAuthenticated() && (resource.data.userId == request.auth.uid || isAdmin());
+      
+      // Messages subcollection
+      match /messages/{messageId} {
+        allow list, get: if isAuthenticated() && (get(/databases/$(database)/documents/chats/$(chatId)).data.userId == request.auth.uid || isAdmin());
+        allow create: if isAuthenticated() && (get(/databases/$(database)/documents/chats/$(chatId)).data.userId == request.auth.uid || isAdmin()) && 
+                      isValidMessage(request.resource.data);
+        allow update, delete: if isAdmin();
+      }
+    }
+
+    // Health check collection for connection validation
+    match /test/{docId} {
+      allow read: if true;
+    }
+  }
+}
+

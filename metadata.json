@@ -1,0 +1,6 @@
+{
+  "name": "Monsieur FABRICEL",
+  "description": "Enseignant de mathématiques et conseiller pédagogique malgache. Assistant didactique conforme au Nouveau Programme d'Études du MEN Madagascar, spécialisé en APC, préparation de cours et formation des enseignants.",
+  "requestFramePermissions": ["microphone"],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

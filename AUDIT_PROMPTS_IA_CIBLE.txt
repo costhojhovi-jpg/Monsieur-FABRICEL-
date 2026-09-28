@@ -1,0 +1,36 @@
+﻿
+Path                                                                      LineNumber Line                                                                                       
+----                                                                      ---------- ----                                                                                       
+C:\Users\ACER\Desktop\Monsieur-Fabricel\src\services\ai\AIService.ts               8 import { GeminiProvider } from "./GeminiProvider";                                         
+C:\Users\ACER\Desktop\Monsieur-Fabricel\src\services\ai\AIService.ts              15     const geminiProvider = new GeminiProvider();                                           
+C:\Users\ACER\Desktop\Monsieur-Fabricel\src\services\ai\AIService.ts              18       ["gemini", geminiProvider],                                                          
+C:\Users\ACER\Desktop\Monsieur-Fabricel\src\services\ai\GeminiProvider.ts         24 export class GeminiProvider implements AIProvider {                                        
+C:\Users\ACER\Desktop\Monsieur-Fabricel\src\services\geminiService.ts              1 import { SYSTEM_INSTRUCTION } from "./systemPrompt";                                       
+C:\Users\ACER\Desktop\Monsieur-Fabricel\src\services\geminiService.ts             13 export { SYSTEM_INSTRUCTION };                                                             
+C:\Users\ACER\Desktop\Monsieur-Fabricel\src\services\geminiService.ts             50 export function generateDidacticFallback(prompt: string): string {                         
+C:\Users\ACER\Desktop\Monsieur-Fabricel\src\services\geminiService.ts            218 export async function chatWithGemini(history: Message[]): Promise<string> {                
+C:\Users\ACER\Desktop\Monsieur-Fabricel\src\services\geminiService.ts            242       return generateDidacticFallback(latestMessage);                                      
+C:\Users\ACER\Desktop\Monsieur-Fabricel\src\services\geminiService.ts            246     return data.text || generateDidacticFallback(latestMessage);                           
+C:\Users\ACER\Desktop\Monsieur-Fabricel\src\services\geminiService.ts            249     return generateDidacticFallback(latestMessage);                                        
+C:\Users\ACER\Desktop\Monsieur-Fabricel\src\services\geminiService.ts            253 export async function* chatWithGeminiStream(history: Message[]) {                          
+C:\Users\ACER\Desktop\Monsieur-Fabricel\src\services\geminiService.ts            276       const fallbackContent = generateDidacticFallback(latestMessage);                     
+C:\Users\ACER\Desktop\Monsieur-Fabricel\src\services\geminiService.ts            314               const fallbackContent = generateDidacticFallback(latestMessage);             
+C:\Users\ACER\Desktop\Monsieur-Fabricel\src\services\geminiService.ts            335     const fallbackContent = generateDidacticFallback(latestMessage);                       
+C:\Users\ACER\Desktop\Monsieur-Fabricel\src\services\systemPrompt.ts               1 export const SYSTEM_INSTRUCTION = `                                                        
+C:\Users\ACER\Desktop\Monsieur-Fabricel\src\types\ai.ts                           10   systemInstruction?: string;                                                              
+C:\Users\ACER\Desktop\Monsieur-Fabricel\src\App.tsx                               57 import { Message, generateDidacticFallback } from "@/services/geminiService";              
+C:\Users\ACER\Desktop\Monsieur-Fabricel\src\App.tsx                             4550       const offlineDidacticText = generateDidacticFallback(text);                          
+C:\Users\ACER\Desktop\Monsieur-Fabricel\src\App.tsx                             4668       const stream = aiService.stream({                                                    
+C:\Users\ACER\Desktop\Monsieur-Fabricel\src\App.tsx                             4708       const fallbackDidactic = generateDidacticFallback(text);                             
+C:\Users\ACER\Desktop\Monsieur-Fabricel\server.ts                                  4 import { GoogleGenAI } from "@google/genai";                                               
+C:\Users\ACER\Desktop\Monsieur-Fabricel\server.ts                                  5 import { SYSTEM_INSTRUCTION } from "./src/services/systemPrompt";                          
+C:\Users\ACER\Desktop\Monsieur-Fabricel\server.ts                                 37   async function streamWithRetry(ai: GoogleGenAI, contents: any[], res: express.Response) {
+C:\Users\ACER\Desktop\Monsieur-Fabricel\server.ts                                 57               systemInstruction: SYSTEM_INSTRUCTION,                                       
+C:\Users\ACER\Desktop\Monsieur-Fabricel\server.ts                                113   async function generateWithRetry(ai: GoogleGenAI, contents: any[]) {                     
+C:\Users\ACER\Desktop\Monsieur-Fabricel\server.ts                                129               systemInstruction: SYSTEM_INSTRUCTION,                                       
+C:\Users\ACER\Desktop\Monsieur-Fabricel\server.ts                                210       let ai = new GoogleGenAI({                                                           
+C:\Users\ACER\Desktop\Monsieur-Fabricel\server.ts                                230           ai = new GoogleGenAI({                                                           
+C:\Users\ACER\Desktop\Monsieur-Fabricel\server.ts                                292       let ai = new GoogleGenAI({                                                           
+C:\Users\ACER\Desktop\Monsieur-Fabricel\server.ts                                312           ai = new GoogleGenAI({                                                           
+
+
