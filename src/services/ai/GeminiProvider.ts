@@ -5,6 +5,7 @@
 } from "../../types/ai";
 import type { Message } from "../../types/chat";
 import type { AIProvider } from "./AIProvider";
+const API_BASE_URL = "https://monsieur-fabricel.onrender.com";
 
 const getCustomApiKey = (): string | null => {
   if (typeof window !== "undefined") {
@@ -28,7 +29,7 @@ export class GeminiProvider implements AIProvider {
     const history = getMessages(request);
     const customApiKey = getCustomApiKey();
 
-    let response = await fetch("/api/chat", {
+    let response = await fetch(`${API_BASE_URL}/api/chat`, {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
@@ -41,7 +42,7 @@ export class GeminiProvider implements AIProvider {
     });
 
     if (!response.ok && response.status === 404) {
-      response = await fetch("/chat", {
+      response = await fetch(`${API_BASE_URL}/chat`, {
         method: "POST",
         headers: {
           "Content-Type": "application/json",
@@ -82,7 +83,7 @@ export class GeminiProvider implements AIProvider {
     const history = getMessages(request);
     const customApiKey = getCustomApiKey();
 
-    let response = await fetch("/api/chat/stream", {
+    let response = await fetch(`${API_BASE_URL}/api/chat/stream`, {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
@@ -95,7 +96,7 @@ export class GeminiProvider implements AIProvider {
     });
 
     if (!response.ok && response.status === 404) {
-      response = await fetch("/chat/stream", {
+      response = await fetch(`${API_BASE_URL}/chat/stream`, {
         method: "POST",
         headers: {
           "Content-Type": "application/json",
@@ -213,7 +214,7 @@ export class GeminiProvider implements AIProvider {
 
   async isAvailable(): Promise<boolean> {
     try {
-      const response = await fetch("/api/health", {
+      const response = await fetch(`${API_BASE_URL}/api/health`, {
         method: "GET",
         cache: "no-store",
       });

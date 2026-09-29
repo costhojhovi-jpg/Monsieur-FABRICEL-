@@ -1,5 +1,7 @@
 import { SYSTEM_INSTRUCTION } from "./systemPrompt";
 
+const API_BASE_URL = "https://monsieur-fabricel.onrender.com";
+
 export interface Message {
   id?: string;
   role: "user" | "model";
@@ -220,7 +222,7 @@ export async function chatWithGemini(history: Message[]): Promise<string> {
   const latestMessage = history[history.length - 1]?.text || "";
 
   try {
-    let res = await fetch("/api/chat", {
+    let res = await fetch(`${API_BASE_URL}/api/chat`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ history, customApiKey }),
@@ -228,7 +230,7 @@ export async function chatWithGemini(history: Message[]): Promise<string> {
     });
 
     if (!res.ok && res.status === 404) {
-      res = await fetch("/chat", {
+      res = await fetch(`${API_BASE_URL}/chat`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ history, customApiKey }),
@@ -255,7 +257,7 @@ export async function* chatWithGeminiStream(history: Message[]) {
   const latestMessage = history[history.length - 1]?.text || "";
 
   try {
-    let response = await fetch("/api/chat/stream", {
+    let response = await fetch(`${API_BASE_URL}/api/chat/stream`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ history, customApiKey }),
@@ -263,7 +265,7 @@ export async function* chatWithGeminiStream(history: Message[]) {
     });
 
     if (!response.ok && response.status === 404) {
-      response = await fetch("/chat/stream", {
+      response = await fetch(`${API_BASE_URL}/chat/stream`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ history, customApiKey }),
